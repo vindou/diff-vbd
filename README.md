@@ -102,8 +102,3 @@ src/diff_vbd/        # the installable package
 examples/            # example YAML configs
 tests/               # unit tests
 ```
-
-## License
-
-License to be determined. Until a `LICENSE` file is added, all rights are reserved by the
-author; contact before reuse.
