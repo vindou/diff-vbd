@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# diff-vbd simulation outputs / local assets (regenerable, not tracked)
+*.npz
+*.msh
+*.stl
+*.obj
+runtime_report.json
+
+# ...but do track the bundled cantilever example assets
+!examples/beam.msh
+!examples/bc_selector.stl

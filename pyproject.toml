@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "diff-vbd"
+version = "0.1.0"
+description = "Differentiable Vertex Block Descent (VBD) solver for soft-body simulation, built on JAX."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "TBD" }
+authors = [{ name = "Gilbert Chang" }]
+keywords = ["vbd", "simulation", "differentiable", "jax", "finite-element", "soft-body"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+dependencies = [
+    "jax>=0.4.28",
+    "numpy>=1.24",
+    "tqdm>=4.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+cuda = ["jax[cuda12]>=0.4.28"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+diff-vbd = "diff_vbd.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/gchang/diff-vbd"
+Repository = "https://github.com/gchang/diff-vbd"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/diff_vbd"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

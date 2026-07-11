@@ -1,0 +1,35 @@
+mesh:
+  path: beam.msh
+
+selectors:
+  clamp:
+    path: bc_selector.stl
+
+material:
+  mu: 4.638e5
+  lam: 4.174e6
+  density: 1.04
+
+simulation:
+  steps: 100
+
+solver:
+  dt: 0.02
+  num_iterations: 3
+  eps: 1.0e-6
+  acceleration:
+    enabled: false
+    rho: 0.95
+
+body_force:
+  - 0.0
+  - 0.0
+  - -9.81
+
+dirichlet:
+  - selector: clamp
+    mode: position
+    components:
+      - "0.0"
+      - "0.0"
+      - "0.0"
