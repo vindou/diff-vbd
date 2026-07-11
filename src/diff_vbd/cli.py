@@ -249,11 +249,9 @@ def main() -> int:
             else 0.95
         ),
         line_search_enabled=config.solver.line_search.enabled,
-        line_search_alphas=(
-            config.solver.line_search.alphas
-            if config.solver.line_search.alphas is not None
-            else (1.0, 0.5, 0.25, 0.125)
-        ),
+        # Both None is fine: assemble_problem then builds its default linear grid.
+        line_search_alphas=config.solver.line_search.alphas,
+        line_search_num_alphas=config.solver.line_search.num_alphas,
     )
     _log_stage_detail(
         4,

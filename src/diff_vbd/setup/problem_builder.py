@@ -160,14 +160,50 @@ def _validate_chebyshev_options(acceleration_enabled: bool, chebyshev_rho: float
         )
 
 
+DEFAULT_LINE_SEARCH_NUM_ALPHAS = 9
+
+
+def _resolve_line_search_alphas(line_search_alphas, line_search_num_alphas):
+    """Return the alpha grid, generating a linear one from ``num_alphas`` if needed.
+
+    An explicit alpha list always wins. The generated grid runs from 1.0 down to 0.0
+    inclusive: alpha=0 is what lets a vertex decline to move when every positive step
+    would increase its objective, which is what makes this a descent safeguard rather
+    than a step-size lottery. The grid is linear rather than geometric because a
+    geometric grid's extra points collapse toward zero (0.5**16 is already 1.5e-5) and
+    stop adding resolution where it matters.
+    """
+    if line_search_alphas is not None and line_search_num_alphas is not None:
+        raise ValueError(
+            "specify line_search_alphas or line_search_num_alphas, not both"
+        )
+    if line_search_alphas is not None:
+        return line_search_alphas
+
+    num_alphas = (
+        DEFAULT_LINE_SEARCH_NUM_ALPHAS
+        if line_search_num_alphas is None
+        else line_search_num_alphas
+    )
+    if int(num_alphas) < 2:
+        raise ValueError(
+            f"line_search_num_alphas must be at least 2, got {num_alphas}"
+        )
+    return jnp.linspace(1.0, 0.0, int(num_alphas))
+
+
 def _validate_line_search_options(line_search_alphas):
     alphas = jnp.asarray(line_search_alphas)
     if alphas.ndim != 1:
         raise ValueError(f"line_search_alphas must be rank 1, got {alphas.shape}")
     if alphas.shape[0] == 0:
         raise ValueError("line_search_alphas must contain at least one alpha")
-    if not bool(jnp.all((alphas > 0.0) & (alphas <= 1.0))):
-        raise ValueError("line_search_alphas must satisfy 0 < alpha <= 1")
+    if not bool(jnp.all((alphas >= 0.0) & (alphas <= 1.0))):
+        raise ValueError("line_search_alphas must satisfy 0 <= alpha <= 1")
+    if not bool(jnp.any(alphas > 0.0)):
+        raise ValueError(
+            "line_search_alphas must contain at least one positive alpha"
+        )
 
 
 def assemble_problem(
@@ -185,7 +221,8 @@ def assemble_problem(
     acceleration_enabled: bool = False,
     chebyshev_rho: float = 0.95,
     line_search_enabled: bool = True,
-    line_search_alphas: Iterable[float] | jnp.ndarray = (1.0, 0.5, 0.25, 0.125),
+    line_search_alphas: Iterable[float] | jnp.ndarray | None = None,
+    line_search_num_alphas: int | None = None,
 ) -> SimulationProblem:
     """Assemble a validated solver-ready problem from mesh and setup arrays."""
     rest_positions = jnp.asarray(rest_positions)
@@ -194,6 +231,9 @@ def assemble_problem(
 
     _validate_mesh(rest_positions, tets)
     _validate_chebyshev_options(acceleration_enabled, chebyshev_rho)
+    line_search_alphas = _resolve_line_search_alphas(
+        line_search_alphas, line_search_num_alphas
+    )
     _validate_line_search_options(line_search_alphas)
     if isinstance(boundary_data, BoundaryConditions):
         boundary_conditions = boundary_data

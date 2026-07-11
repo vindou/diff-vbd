@@ -42,6 +42,7 @@ class AccelerationConfig:
 class LineSearchConfig:
     enabled: bool
     alphas: tuple[float, ...] | None
+    num_alphas: int | None = None
 
 
 @dataclass(frozen=True)
@@ -246,9 +247,26 @@ def _parse_line_search_config(data: Any) -> LineSearchConfig:
         raise ValueError("solver.line_search.enabled must be a boolean")
 
     alphas_raw = section.get("alphas")
+    num_alphas_raw = section.get("num_alphas")
+    if alphas_raw is not None and num_alphas_raw is not None:
+        raise ValueError(
+            "set solver.line_search.alphas or solver.line_search.num_alphas, not both"
+        )
+
+    if num_alphas_raw is not None:
+        num_alphas = _require_int(num_alphas_raw, "solver.line_search.num_alphas")
+        if num_alphas < 2:
+            raise ValueError("solver.line_search.num_alphas must be at least 2")
+        return LineSearchConfig(
+            enabled=enabled_raw, alphas=None, num_alphas=num_alphas
+        )
+
     if alphas_raw is None:
         if enabled_raw:
-            raise ValueError("solver.line_search.alphas is required when line search is enabled")
+            raise ValueError(
+                "solver.line_search.alphas is required when line search is enabled "
+                "(or set solver.line_search.num_alphas instead)"
+            )
         return LineSearchConfig(enabled=False, alphas=None)
 
     if not isinstance(alphas_raw, (list, tuple)):
@@ -260,8 +278,14 @@ def _parse_line_search_config(data: Any) -> LineSearchConfig:
         _require_float(value, f"solver.line_search.alphas[{index}]")
         for index, value in enumerate(alphas_raw)
     )
-    if not all(0.0 < alpha <= 1.0 for alpha in alphas):
-        raise ValueError("solver.line_search.alphas must satisfy 0 < alpha <= 1")
+    # alpha=0 is allowed: it is the "decline to move" option that makes the line search
+    # a descent safeguard rather than a forced step.
+    if not all(0.0 <= alpha <= 1.0 for alpha in alphas):
+        raise ValueError("solver.line_search.alphas must satisfy 0 <= alpha <= 1")
+    if not any(alpha > 0.0 for alpha in alphas):
+        raise ValueError(
+            "solver.line_search.alphas must contain at least one positive alpha"
+        )
 
     return LineSearchConfig(enabled=enabled_raw, alphas=alphas)
 
@@ -435,9 +459,7 @@ def load_problem_from_yaml(
             else 0.95
         ),
         line_search_enabled=config.solver.line_search.enabled,
-        line_search_alphas=(
-            config.solver.line_search.alphas
-            if config.solver.line_search.alphas is not None
-            else (1.0, 0.5, 0.25, 0.125)
-        ),
+        # Both None is fine: assemble_problem then builds its default linear grid.
+        line_search_alphas=config.solver.line_search.alphas,
+        line_search_num_alphas=config.solver.line_search.num_alphas,
     )

@@ -852,7 +852,7 @@ class DiffVbdTests(unittest.TestCase):
                 line_search_alphas=(1.0, 1.5),
             )
 
-            with self.assertRaisesRegex(ValueError, "0 < alpha <= 1"):
+            with self.assertRaisesRegex(ValueError, "0 <= alpha <= 1"):
                 load_config(config_path)
 
     def test_extract_surface_mesh_returns_boundary_faces(self):
@@ -1061,12 +1061,71 @@ class DiffVbdTests(unittest.TestCase):
         )
         tets = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
         free_mask = jnp.array([0.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
-        with self.assertRaisesRegex(ValueError, "0 < alpha <= 1"):
+        with self.assertRaisesRegex(ValueError, "0 <= alpha <= 1"):
+            assemble_problem(
+                positions, tets, free_mask, line_search_alphas=(1.0, 1.5)
+            )
+        with self.assertRaisesRegex(ValueError, "0 <= alpha <= 1"):
+            assemble_problem(
+                positions, tets, free_mask, line_search_alphas=(1.0, -0.25)
+            )
+
+    def test_assemble_problem_accepts_zero_line_search_alpha(self):
+        positions = jnp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        tets = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
+        free_mask = jnp.array([0.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
+
+        # alpha=0 is the "decline to move" option; it must be a legal grid point.
+        problem = assemble_problem(
+            positions, tets, free_mask, line_search_alphas=(1.0, 0.5, 0.0)
+        )
+        self.assertAlmostEqual(float(problem.solver.line_search.alphas[-1]), 0.0)
+
+    def test_assemble_problem_rejects_all_zero_line_search_alphas(self):
+        positions = jnp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        tets = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
+        free_mask = jnp.array([0.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
+
+        # An all-zero grid would freeze every vertex forever.
+        with self.assertRaisesRegex(ValueError, "at least one positive alpha"):
+            assemble_problem(
+                positions, tets, free_mask, line_search_alphas=(0.0, 0.0)
+            )
+
+    def test_assemble_problem_generates_linear_grid_from_num_alphas(self):
+        positions = jnp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        tets = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
+        free_mask = jnp.array([0.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
+
+        problem = assemble_problem(
+            positions, tets, free_mask, line_search_num_alphas=9
+        )
+        self.assertTrue(
+            jnp.allclose(
+                problem.solver.line_search.alphas, jnp.linspace(1.0, 0.0, 9)
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "at least 2"):
+            assemble_problem(
+                positions, tets, free_mask, line_search_num_alphas=1
+            )
+        with self.assertRaisesRegex(ValueError, "not both"):
             assemble_problem(
                 positions,
                 tets,
                 free_mask,
                 line_search_alphas=(1.0, 0.0),
+                line_search_num_alphas=9,
             )
 
     def test_assemble_problem_rejects_invalid_chebyshev_rho(self):
@@ -1190,8 +1249,7 @@ class DiffVbdTests(unittest.TestCase):
         self.assertTrue(bool(problem.solver.line_search.enabled))
         self.assertTrue(
             jnp.allclose(
-                problem.solver.line_search.alphas,
-                jnp.array([1.0, 0.5, 0.25, 0.125], dtype=jnp.float32),
+                problem.solver.line_search.alphas, jnp.linspace(1.0, 0.0, 9)
             )
         )
 
@@ -1304,6 +1362,31 @@ class StableNeoHookeanTests(unittest.TestCase):
         self.assertAlmostEqual(float(hessian[0, 0, 1, 1]), lam, places=3)
         self.assertAlmostEqual(float(hessian[0, 1, 0, 1]), mu, places=3)
 
+    def test_energy_resolves_small_strains_without_cancellation(self):
+        """The energy must not quantize to noise near rest, or the line search guesses.
+
+        The textbook form computes ``sum(f*f) - 3`` with ``sum(f*f) ~ 3``; scaled by a
+        stiff ``mu`` its float32 rounding error swamps the true energy. Here the energy
+        at a 1e-5 strain must stay far below the energy at a 10x larger strain, which
+        the cancelling form cannot do (it returns the same quantized value for both).
+        """
+        material = _material(mu=4.638e5, lam=4.174e6)
+        direction = jnp.array(
+            [[1.0, 0.3, 0.0], [0.0, -0.5, 0.2], [0.1, 0.0, 0.7]], dtype=jnp.float32
+        )
+
+        def energy(strain):
+            return float(
+                stable_neo_hookean_energy_density(
+                    material, jnp.eye(3) + strain * direction
+                )
+            )
+
+        small, large = energy(1.0e-5), energy(1.0e-4)
+        # Energy is quadratic in strain, so a 10x strain is ~100x the energy.
+        self.assertGreater(large, 0.0)
+        self.assertLess(small, large / 10.0)
+
     def test_tet_energy_is_zero_in_the_rest_pose(self):
         rest = jnp.array(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -1382,6 +1465,111 @@ class InvertedMeshValidationTests(unittest.TestCase):
 
         problem = assemble_problem(positions, tets, free_mask)
         self.assertEqual(problem.mesh.tets.shape, (1, 4))
+
+
+def _beam_problem(*, num_iterations, line_search_alphas=None, line_search_num_alphas=None):
+    """A small clamped beam: enough vertices for the line search to matter."""
+    nx, ny, nz = 4, 2, 2
+    grid = jnp.stack(
+        jnp.meshgrid(
+            jnp.arange(nx, dtype=jnp.float32),
+            jnp.arange(ny, dtype=jnp.float32),
+            jnp.arange(nz, dtype=jnp.float32),
+            indexing="ij",
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    index = lambda i, j, k: (i * ny + j) * nz + k
+    # Each unit cube is split into 5 tets, all positively wound.
+    tets = []
+    for i in range(nx - 1):
+        for j in range(ny - 1):
+            for k in range(nz - 1):
+                c = [index(i + a, j + b, k + d) for a in (0, 1) for b in (0, 1) for d in (0, 1)]
+                v000, v001, v010, v011, v100, v101, v110, v111 = c
+                tets += [
+                    [v000, v100, v010, v001],
+                    [v110, v010, v100, v111],
+                    [v101, v100, v001, v111],
+                    [v011, v001, v010, v111],
+                    [v100, v010, v001, v111],
+                ]
+    tets = jnp.array(tets, dtype=jnp.int32)
+    free_mask = jnp.where(grid[:, 0] == 0.0, 0.0, 1.0).astype(jnp.float32)
+    return assemble_problem(
+        grid,
+        tets,
+        free_mask,
+        dt=0.02,
+        external_acceleration=(0.0, 0.0, -9.81),
+        num_iterations=num_iterations,
+        mu=1.0e4,
+        lam=1.0e4,
+        eps=1.0e-6,
+        line_search_enabled=True,
+        line_search_alphas=line_search_alphas,
+        line_search_num_alphas=line_search_num_alphas,
+    )
+
+
+class LineSearchDescentTests(unittest.TestCase):
+    def test_line_search_never_increases_the_local_objective(self):
+        """The property that is false without alpha=0, and the point of the change."""
+        problem = _beam_problem(num_iterations=1)
+        state = initial_state(problem)
+        target = predict_inertial_target(problem, state)
+        free = np.where(
+            ~np.asarray(problem.boundary_conditions.dirichlet_mask)
+        )[0]
+
+        def objective(vertex_index, x_i):
+            return vertex_local_objective(
+                problem, state.position, target, vertex_index, x_i
+            )
+
+        increased = 0
+        for vertex in free:
+            vertex_index = jnp.asarray(vertex, dtype=jnp.int32)
+            before = objective(vertex_index, state.position[vertex_index])
+            after = objective(
+                vertex_index,
+                solve_local_vertex_step(
+                    problem, state.position, target, vertex_index
+                ),
+            )
+            if float(after) > float(before) + 1.0e-4 * abs(float(before)) + 1.0e-6:
+                increased += 1
+
+        self.assertEqual(
+            increased,
+            0,
+            f"{increased}/{len(free)} vertices took an objective-increasing step",
+        )
+
+    def _simulate_beam(self, num_iterations, alphas=None):
+        problem = _beam_problem(num_iterations=num_iterations, line_search_alphas=alphas)
+        final, _ = simulate(
+            problem, initial_state(problem), num_steps=10, show_progress=False
+        )
+        return np.asarray(final.position)
+
+    def test_solution_is_invariant_to_num_iterations(self):
+        """Once converged, extra sweeps must not move the answer."""
+        drift = np.abs(self._simulate_beam(20) - self._simulate_beam(60)).max()
+        self.assertLess(drift, 1.0e-5, f"solution moved by {drift:.3e} when sweeps grew")
+
+    def test_line_search_without_zero_alpha_diverges_with_num_iterations(self):
+        """Pins the bug this change fixes, so it cannot silently come back.
+
+        With no alpha=0 on the grid the line search cannot decline to move, so it is
+        forced to return objective-increasing steps. Those pump energy into the mesh and
+        the deflection keeps growing as sweeps are added instead of settling.
+        """
+        no_zero = (1.0, 0.5, 0.25, 0.125)
+        drift = np.abs(
+            self._simulate_beam(20, no_zero) - self._simulate_beam(60, no_zero)
+        ).max()
+        self.assertGreater(drift, 1.0e-3)
 
 
 class InvertedElementRecoveryTests(unittest.TestCase):

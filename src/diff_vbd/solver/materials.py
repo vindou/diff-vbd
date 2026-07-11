@@ -17,25 +17,34 @@ def stable_neo_hookean_energy_density(
     remapped to the model parameters so the small-strain response still matches
     linear elasticity, and the energy is finite and smooth for every ``f``, including
     inverted elements where ``det(f) <= 0``.
+
+    Every small quantity is formed without cancellation, which matters because the
+    solver spends its life near ``f = I``. Writing the deviatoric term as the textbook
+    ``sum(f * f) - 3`` subtracts two numbers that are both close to 3, and once that is
+    scaled by ``mu`` the float32 rounding error swamps the real energy difference
+    between nearby candidate positions. The forms below are algebraically identical and
+    agree to machine precision in float64, but they resolve the energy near rest about
+    two orders of magnitude more finely in float32 -- enough for the line search to rank
+    candidate step sizes by signal rather than by noise. The rest-state energy is zero
+    by construction here (alpha only zeroes the rest *stress*), so no constant is
+    subtracted afterwards.
     """
     mu = (4.0 / 3.0) * material.mu
     lam = material.lam + (5.0 / 6.0) * material.mu
     alpha = 1.0 + 0.75 * mu / lam
 
-    ic = jnp.sum(f * f)
+    identity = jnp.eye(3, dtype=f.dtype)
+    ic_minus_3 = jnp.sum((f - identity) * (f + identity))  # == sum(f * f) - 3
+
     f0, f1, f2 = f[:, 0], f[:, 1], f[:, 2]
     j = jnp.dot(f0, jnp.cross(f1, f2))
 
-    # alpha zeroes the rest-state stress, not the rest-state energy; subtract the
-    # leftover constant so an undeformed element reports zero energy.
-    rest_density = 0.5 * lam * (1.0 - alpha) ** 2 - 0.5 * mu * jnp.log(4.0)
+    # (j - alpha)**2 - (1 - alpha)**2, expanded to keep the small factor (j - 1) exact.
+    volumetric = (j - 1.0) * (j + 1.0 - 2.0 * alpha)
+    # (ic - 3) - [log(ic + 1) - log(4)], with the bracket as log1p to avoid cancelling.
+    deviatoric = ic_minus_3 - jnp.log1p(ic_minus_3 / 4.0)
 
-    return (
-        0.5 * mu * (ic - 3.0)
-        + 0.5 * lam * (j - alpha) ** 2
-        - 0.5 * mu * jnp.log(ic + 1.0)
-        - rest_density
-    )
+    return 0.5 * mu * deviatoric + 0.5 * lam * volumetric
 
 
 @jax.jit

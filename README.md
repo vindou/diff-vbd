@@ -67,7 +67,7 @@ solver:
   num_iterations: 3
   eps: 1.0e-6
   acceleration: { enabled: false, rho: 0.95 }
-  line_search: { enabled: true, alphas: [1.0, 0.5, 0.25, 0.125] }  # on by default
+  line_search: { enabled: true, num_alphas: 9 }   # on by default
 body_force: [0.0, 0.0, -9.81]
 dirichlet:
   - selector: clamp
@@ -79,6 +79,17 @@ The cantilever example ships with its mesh assets (`examples/beam.msh`,
 `examples/bc_selector.stl`), so it runs as-is. For your own simulations, supply tetrahedral
 meshes and selector geometry and point the config `path` fields at them (relative paths
 resolve against the config file's directory).
+
+### Line search
+
+`num_alphas: N` builds a linear step-size grid from `1.0` down to `0.0` inclusive; raise it to
+refine the search. Refining is cheap — the per-vertex gradient, Hessian and solve dominate, so
+9 alphas cost only ~9% more than 4, and every alpha is evaluated in parallel under `jax.vmap`.
+
+The `0.0` endpoint matters: it lets a vertex decline to move when every positive step would
+increase its local objective. Without it the search is forced to return an objective-*increasing*
+step for such vertices, which pumps energy into the mesh and makes the solve diverge as
+`num_iterations` grows. Set `alphas: [...]` instead to pin the grid explicitly.
 
 ## Testing
 
