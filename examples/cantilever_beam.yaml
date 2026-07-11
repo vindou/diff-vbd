@@ -20,6 +20,9 @@ solver:
   acceleration:
     enabled: false
     rho: 0.95
+  line_search:
+    enabled: true
+    alphas: [1.0, 0.5, 0.25, 0.125]
 
 body_force:
   - 0.0

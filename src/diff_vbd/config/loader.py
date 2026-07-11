@@ -236,7 +236,9 @@ def _parse_acceleration_config(data: Any) -> AccelerationConfig:
 
 def _parse_line_search_config(data: Any) -> LineSearchConfig:
     if data is None:
-        return LineSearchConfig(enabled=False, alphas=None)
+        # Line search is the only guard against an inverting step, so it is on unless
+        # a config opts out explicitly. alphas=None picks up the caller's defaults.
+        return LineSearchConfig(enabled=True, alphas=None)
 
     section = _require_mapping(data, "solver.line_search")
     enabled_raw = section.get("enabled", False)

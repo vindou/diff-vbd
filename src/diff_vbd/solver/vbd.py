@@ -58,6 +58,19 @@ vertex_local_hessian = jax.jit(jax.hessian(vertex_local_objective, argnums=4))
 
 
 @jax.jit
+def clamped_hessian(hessian: jnp.ndarray, eps: jnp.ndarray) -> jnp.ndarray:
+    """Return the nearest positive-definite matrix with eigenvalues at least ``eps``.
+
+    The stable Neo-Hookean energy is nonconvex, so the local Hessian can be indefinite
+    under compression or inversion. Solving with an indefinite Hessian yields an ascent
+    direction along its negative eigenvectors, so the eigenvalues are floored while the
+    eigenvectors are left untouched.
+    """
+    eigenvalues, eigenvectors = jnp.linalg.eigh(hessian)
+    return (eigenvectors * jnp.maximum(eigenvalues, eps)) @ eigenvectors.T
+
+
+@jax.jit
 def _apply_line_search(
     problem: SimulationProblem,
     block_position: jnp.ndarray,
@@ -95,9 +108,7 @@ def solve_local_vertex_step(
     hessian = vertex_local_hessian(
         problem, block_position, inertial_target, vertex_index, x_i_iter
     )
-    regularized_hessian = hessian + problem.solver.eps * jnp.eye(
-        x_i_iter.shape[0], dtype=x_i_iter.dtype
-    )
+    regularized_hessian = clamped_hessian(hessian, problem.solver.eps)
     delta_x = jnp.linalg.solve(regularized_hessian, -gradient)
 
     def line_search_step(_):

@@ -2,8 +2,8 @@
 
 A differentiable **Vertex Block Descent (VBD)** solver for soft-body simulation, built on
 [JAX](https://github.com/jax-ml/jax). It loads tetrahedral meshes, assembles boundary
-conditions from selector geometry, and time-integrates a Neo-Hookean elastic model with
-optional Chebyshev acceleration and line search.
+conditions from selector geometry, and time-integrates a stable Neo-Hookean elastic model
+(Smith et al. 2018) with optional Chebyshev acceleration and line search.
 
 ## Installation
 
@@ -67,6 +67,7 @@ solver:
   num_iterations: 3
   eps: 1.0e-6
   acceleration: { enabled: false, rho: 0.95 }
+  line_search: { enabled: true, alphas: [1.0, 0.5, 0.25, 0.125] }  # on by default
 body_force: [0.0, 0.0, -9.81]
 dirichlet:
   - selector: clamp
@@ -95,7 +96,7 @@ src/diff_vbd/        # the installable package
   config/            #   YAML config loading
   setup/             #   mesh & selector I/O, topology, boundary conditions
   problems/          #   ready-made problem builders (e.g. cantilever)
-  solver/            #   VBD kinematics, neo-Hookean materials, time integration
+  solver/            #   VBD kinematics, stable Neo-Hookean materials, time integration
   export/            #   NPZ trajectory export
   cli.py             #   `diff-vbd` command-line runner
   runtime_config.py  #   JAX/XLA backend configuration

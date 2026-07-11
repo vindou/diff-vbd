@@ -33,8 +33,11 @@ from diff_vbd.setup import (
     parse_binary_stl_mesh,
     parse_gmsh22_binary_tets,
 )
+from diff_vbd.model import MaterialParams, SimulationState
+from diff_vbd.solver.materials import stable_neo_hookean_energy_density, tet_energy
 from diff_vbd.solver.vbd import (
     chebyshev_weight,
+    clamped_hessian,
     predict_inertial_target,
     solve_local_vertex_step,
     sweep_positions,
@@ -207,6 +210,7 @@ def _write_yaml_config(
     acceleration_rho: float | None = None,
     line_search_enabled: bool = False,
     line_search_alphas: tuple[float, ...] | None = None,
+    include_line_search: bool = True,
     selector_classification_mode: str | None = None,
     selector_grid_resolution: int | None = None,
     selector_atol: float | None = None,
@@ -232,19 +236,20 @@ def _write_yaml_config(
     ]
     if acceleration_rho is not None:
         lines.append(f"    rho: {acceleration_rho}")
-    lines.extend(
-        [
-            "  line_search:",
-            f"    enabled: {'true' if line_search_enabled else 'false'}",
-        ]
-    )
-    if line_search_alphas is not None:
-        if len(line_search_alphas) == 0:
-            lines.append("    alphas: []")
-        else:
-            lines.append("    alphas:")
-            for alpha in line_search_alphas:
-                lines.append(f"      - {alpha}")
+    if include_line_search:
+        lines.extend(
+            [
+                "  line_search:",
+                f"    enabled: {'true' if line_search_enabled else 'false'}",
+            ]
+        )
+        if line_search_alphas is not None:
+            if len(line_search_alphas) == 0:
+                lines.append("    alphas: []")
+            else:
+                lines.append("    alphas:")
+                for alpha in line_search_alphas:
+                    lines.append(f"      - {alpha}")
     if (
         selector_classification_mode is not None
         or selector_grid_resolution is not None
@@ -1115,6 +1120,7 @@ class DiffVbdTests(unittest.TestCase):
             eps=1.0e-5,
             acceleration_enabled=False,
             chebyshev_rho=0.95,
+            line_search_enabled=False,
         )
         state_off = initial_state(accelerated_off_problem)
         swept_off = sweep_positions(
@@ -1165,6 +1171,269 @@ class DiffVbdTests(unittest.TestCase):
         runtime_config = apply_runtime_config(platform="gpu")
         self.assertEqual(runtime_config["platform"], "gpu")
         self.assertFalse(runtime_config["gpu_preallocate"])
+
+    def test_load_config_enables_line_search_when_section_is_absent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            mesh_path = tmpdir_path / "beam.msh"
+            selector_path = tmpdir_path / "selector.stl"
+            config_path = tmpdir_path / "problem.yaml"
+            _write_binary_gmsh22(mesh_path)
+            _write_closed_tetra_selector(selector_path)
+            _write_yaml_config(
+                config_path, "beam.msh", "selector.stl", include_line_search=False
+            )
+            config = load_config(config_path)
+            problem = load_problem_from_yaml(config_path)
+
+        self.assertTrue(config.solver.line_search.enabled)
+        self.assertTrue(bool(problem.solver.line_search.enabled))
+        self.assertTrue(
+            jnp.allclose(
+                problem.solver.line_search.alphas,
+                jnp.array([1.0, 0.5, 0.25, 0.125], dtype=jnp.float32),
+            )
+        )
+
+
+def _material(mu=10.0, lam=7.0):
+    return MaterialParams(
+        mu=jnp.asarray(mu, dtype=jnp.float32),
+        lam=jnp.asarray(lam, dtype=jnp.float32),
+        density=jnp.asarray(1.0, dtype=jnp.float32),
+    )
+
+
+def _analytic_first_piola(material, f):
+    """Closed-form dPsi/dF, derived independently of the autodiff path under test."""
+    mu = (4.0 / 3.0) * material.mu
+    lam = material.lam + (5.0 / 6.0) * material.mu
+    alpha = 1.0 + 0.75 * mu / lam
+
+    ic = jnp.sum(f * f)
+    f0, f1, f2 = f[:, 0], f[:, 1], f[:, 2]
+    j = jnp.dot(f0, jnp.cross(f1, f2))
+    dj_df = jnp.stack(
+        [jnp.cross(f1, f2), jnp.cross(f2, f0), jnp.cross(f0, f1)], axis=1
+    )
+    return mu * f + lam * (j - alpha) * dj_df - mu * f / (ic + 1.0)
+
+
+class StableNeoHookeanTests(unittest.TestCase):
+    def test_rest_state_has_zero_energy(self):
+        density = stable_neo_hookean_energy_density(_material(), jnp.eye(3))
+        self.assertAlmostEqual(float(density), 0.0, places=5)
+
+    def test_rest_state_is_stress_free(self):
+        stress = jax.grad(stable_neo_hookean_energy_density, argnums=1)(
+            _material(), jnp.eye(3)
+        )
+        self.assertTrue(jnp.allclose(stress, jnp.zeros((3, 3)), atol=1.0e-5))
+
+    def test_autodiff_stress_matches_analytic_first_piola(self):
+        material = _material()
+        deformations = [
+            jnp.eye(3),
+            jnp.array(
+                [[1.2, 0.1, -0.3], [0.0, 0.9, 0.2], [0.15, -0.05, 1.1]],
+                dtype=jnp.float32,
+            ),
+            jnp.diag(jnp.array([1.0, 1.0, -0.5], dtype=jnp.float32)),
+        ]
+        for f in deformations:
+            with self.subTest(determinant=float(jnp.linalg.det(f))):
+                autodiff = jax.grad(stable_neo_hookean_energy_density, argnums=1)(
+                    material, f
+                )
+                self.assertTrue(
+                    jnp.allclose(
+                        autodiff, _analytic_first_piola(material, f), rtol=1.0e-4,
+                        atol=1.0e-4,
+                    )
+                )
+
+    def test_inverted_element_has_finite_energy_and_restoring_force(self):
+        material = _material()
+        f = jnp.diag(jnp.array([1.0, 1.0, -0.5], dtype=jnp.float32))
+
+        density = stable_neo_hookean_energy_density(material, f)
+        stress = jax.grad(stable_neo_hookean_energy_density, argnums=1)(material, f)
+
+        self.assertTrue(jnp.isfinite(density))
+        # The old log(J) formulation returned a constant barrier here, so its gradient
+        # was exactly zero and an inverted element could never recover.
+        self.assertGreater(float(jnp.max(jnp.abs(stress))), 1.0e-3)
+
+    def test_energy_and_stress_stay_finite_through_the_inversion_boundary(self):
+        material = _material()
+        for scale in [-1.5, -1.0, -0.25, 0.0, 0.25, 1.0, 1.5]:
+            with self.subTest(scale=scale):
+                f = jnp.diag(jnp.array([1.0, 1.0, scale], dtype=jnp.float32))
+                density = stable_neo_hookean_energy_density(material, f)
+                stress = jax.grad(stable_neo_hookean_energy_density, argnums=1)(
+                    material, f
+                )
+                self.assertTrue(jnp.isfinite(density))
+                self.assertTrue(jnp.all(jnp.isfinite(stress)))
+
+    def test_energy_is_rotation_invariant(self):
+        material = _material()
+        f = jnp.array(
+            [[1.2, 0.1, -0.3], [0.0, 0.9, 0.2], [0.15, -0.05, 1.1]], dtype=jnp.float32
+        )
+        rotation, _ = jnp.linalg.qr(
+            jax.random.normal(jax.random.PRNGKey(0), (3, 3), dtype=jnp.float32)
+        )
+        rotation = rotation * jnp.sign(jnp.linalg.det(rotation))
+
+        self.assertAlmostEqual(
+            float(stable_neo_hookean_energy_density(material, rotation @ f)),
+            float(stable_neo_hookean_energy_density(material, f)),
+            places=4,
+        )
+
+    def test_small_strain_response_matches_linear_elasticity(self):
+        mu, lam = 10.0, 7.0
+        hessian = jax.hessian(stable_neo_hookean_energy_density, argnums=1)(
+            _material(mu, lam), jnp.eye(3)
+        )
+
+        # The 4/3 and 5/6 remap exists precisely so these recover the physical Lame
+        # parameters; if they drift, every solver tuning constant silently changes.
+        self.assertAlmostEqual(float(hessian[0, 0, 0, 0]), lam + 2.0 * mu, places=3)
+        self.assertAlmostEqual(float(hessian[0, 0, 1, 1]), lam, places=3)
+        self.assertAlmostEqual(float(hessian[0, 1, 0, 1]), mu, places=3)
+
+    def test_tet_energy_is_zero_in_the_rest_pose(self):
+        rest = jnp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        energy = tet_energy(_material(), rest, rest)
+        self.assertAlmostEqual(float(energy), 0.0, places=5)
+
+
+class ClampedHessianTests(unittest.TestCase):
+    def _indefinite_hessian(self):
+        material = _material()
+        f = jnp.diag(jnp.array([1.0, 1.0, -0.5], dtype=jnp.float32))
+        hessian = jax.hessian(stable_neo_hookean_energy_density, argnums=1)(material, f)
+        return hessian.reshape(9, 9)
+
+    def test_energy_hessian_is_indefinite_under_inversion(self):
+        # Guards the premise of the clamp: without it, solve() returns an ascent
+        # direction along these negative eigenvectors.
+        eigenvalues = jnp.linalg.eigvalsh(self._indefinite_hessian())
+        self.assertLess(float(jnp.min(eigenvalues)), 0.0)
+
+    def test_clamped_hessian_floors_eigenvalues_at_eps(self):
+        # eps is kept well above the float32 reconstruction noise of a matrix whose
+        # eigenvalues run to ~100, so this measures the clamp and not round-off.
+        eps = jnp.asarray(1.0, dtype=jnp.float32)
+        clamped = clamped_hessian(self._indefinite_hessian(), eps)
+        eigenvalues = jnp.linalg.eigvalsh(clamped)
+
+        self.assertGreaterEqual(float(jnp.min(eigenvalues)), float(eps) - 1.0e-3)
+
+    def test_clamped_hessian_preserves_eigenvectors(self):
+        eps = jnp.asarray(1.0, dtype=jnp.float32)
+        hessian = self._indefinite_hessian()
+        eigenvalues, eigenvectors = jnp.linalg.eigh(hessian)
+        clamped = clamped_hessian(hessian, eps)
+
+        # Each original eigenvector must survive as an eigenvector of the clamped
+        # matrix, with only its eigenvalue raised to the floor. Comparing eigh output
+        # column-by-column would not show this: clamping reorders the spectrum.
+        self.assertLess(float(jnp.min(eigenvalues)), 0.0)
+        for index in range(9):
+            with self.subTest(eigenvalue=float(eigenvalues[index])):
+                eigenvector = eigenvectors[:, index]
+                expected = jnp.maximum(eigenvalues[index], eps) * eigenvector
+                self.assertTrue(
+                    jnp.allclose(clamped @ eigenvector, expected, atol=1.0e-3)
+                )
+
+    def test_clamped_hessian_leaves_a_positive_definite_matrix_alone(self):
+        eps = jnp.asarray(1.0e-6, dtype=jnp.float32)
+        hessian = jnp.diag(jnp.array([3.0, 5.0, 7.0], dtype=jnp.float32))
+        self.assertTrue(jnp.allclose(clamped_hessian(hessian, eps), hessian, atol=1e-5))
+
+
+class InvertedMeshValidationTests(unittest.TestCase):
+    def test_assemble_problem_rejects_negatively_oriented_tet(self):
+        positions = jnp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        # Swapping two vertices flips the winding, so det(F) < 0 in the rest pose.
+        tets = jnp.array([[0, 2, 1, 3]], dtype=jnp.int32)
+        free_mask = jnp.array([0.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
+
+        with self.assertRaisesRegex(ValueError, "non-positive rest volume"):
+            assemble_problem(positions, tets, free_mask)
+
+    def test_assemble_problem_accepts_positively_oriented_tet(self):
+        positions = jnp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        tets = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
+        free_mask = jnp.array([0.0, 1.0, 1.0, 1.0], dtype=jnp.float32)
+
+        problem = assemble_problem(positions, tets, free_mask)
+        self.assertEqual(problem.mesh.tets.shape, (1, 4))
+
+
+class InvertedElementRecoveryTests(unittest.TestCase):
+    def test_inverted_tet_recovers_to_positive_volume(self):
+        """The behavioural payoff: an inverted element must be able to un-invert.
+
+        Under the old log(J) formulation the elastic gradient here is identically zero,
+        so the tet stays inverted forever.
+        """
+        rest = jnp.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=jnp.float32,
+        )
+        tets = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
+        # Pin the base triangle; only the apex is free, pushed through the base plane.
+        free_mask = jnp.array([0.0, 0.0, 0.0, 1.0], dtype=jnp.float32)
+        problem = assemble_problem(
+            rest,
+            tets,
+            free_mask,
+            dt=0.005,
+            external_acceleration=(0.0, 0.0, 0.0),
+            num_iterations=20,
+            mu=10.0,
+            lam=10.0,
+            eps=1.0e-6,
+        )
+
+        inverted = rest.at[3].set(jnp.array([0.2, 0.2, -0.4], dtype=jnp.float32))
+        state = SimulationState(
+            position=inverted,
+            velocity=jnp.zeros_like(inverted),
+            time=jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        self.assertLess(float(_signed_volume(inverted)), 0.0)
+
+        final_state, _ = simulate(problem, state, num_steps=60, show_progress=False)
+
+        self.assertTrue(jnp.all(jnp.isfinite(final_state.position)))
+        self.assertGreater(float(_signed_volume(final_state.position)), 0.0)
+
+
+def _signed_volume(positions):
+    edges = jnp.stack(
+        [
+            positions[1] - positions[0],
+            positions[2] - positions[0],
+            positions[3] - positions[0],
+        ],
+        axis=-1,
+    )
+    return jnp.linalg.det(edges) / 6.0
 
 
 if __name__ == "__main__":

@@ -49,6 +49,26 @@ def _validate_mesh(rest_positions: jnp.ndarray, tets: jnp.ndarray):
             f"tet indices must be in [0, {rest_positions.shape[0] - 1}], got [{min_index}, {max_index}]"
         )
 
+    # The elastic energy is orientation sensitive: a tet whose vertices wind the wrong
+    # way has det(F) < 0 in its own rest pose, so it is deformed before the sim starts.
+    tet_positions = rest_positions[tets]
+    edges = jnp.stack(
+        [
+            tet_positions[:, 1] - tet_positions[:, 0],
+            tet_positions[:, 2] - tet_positions[:, 0],
+            tet_positions[:, 3] - tet_positions[:, 0],
+        ],
+        axis=-1,
+    )
+    signed_volume = jnp.linalg.det(edges) / 6.0
+    bad_tets = jnp.nonzero(signed_volume <= 0.0)[0]
+    if bad_tets.shape[0] > 0:
+        preview = [int(index) for index in bad_tets[:10]]
+        raise ValueError(
+            f"{bad_tets.shape[0]} tet(s) have non-positive rest volume; reorder their "
+            f"vertices so each tet winds positively (first offenders: {preview})"
+        )
+
 
 def _expand_external_acceleration(external_acceleration, num_vertices: int, dtype):
     acceleration = jnp.asarray(external_acceleration, dtype=dtype)
@@ -157,14 +177,14 @@ def assemble_problem(
     *,
     dt=0.02,
     external_acceleration: Iterable[float] | jnp.ndarray = (0.0, 0.0, -9.81),
-    mu=100000000.0,
-    lam=10.0,
+    mu=4.638e5,
+    lam=4.174e6,
     density=1.0,
     eps=1.0e-6,
     num_iterations: int = 10,
     acceleration_enabled: bool = False,
     chebyshev_rho: float = 0.95,
-    line_search_enabled: bool = False,
+    line_search_enabled: bool = True,
     line_search_alphas: Iterable[float] | jnp.ndarray = (1.0, 0.5, 0.25, 0.125),
 ) -> SimulationProblem:
     """Assemble a validated solver-ready problem from mesh and setup arrays."""
