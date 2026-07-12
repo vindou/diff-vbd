@@ -67,6 +67,51 @@ def build_vertex_coloring(tets: jnp.ndarray, num_vertices: int):
     )
 
 
+def build_surface_topology(tets: jnp.ndarray):
+    """Return the boundary triangles and boundary edges, in *global* vertex indices.
+
+    A face is on the boundary exactly when it belongs to a single tet; an interior face is
+    shared by two. The winding is kept outward, which contact needs -- an inverted triangle
+    reports its normal backwards and the barrier then pushes the wrong way.
+
+    Note this deliberately does *not* reuse ``export.extract_surface_mesh``: that one
+    re-indexes into a compact surface-local numbering for writing meshes out, whereas
+    contact has to index straight into ``position``, ``mass`` and the incidence tables, all
+    of which are in global indices.
+
+    Surface **edges** exist nowhere else in the codebase and are what edge-edge primitives
+    are built from.
+    """
+    # The four faces of a tet, wound so their normals point out of the tet.
+    face_offsets = ((0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3))
+
+    face_counts: dict[tuple[int, ...], int] = {}
+    face_table: dict[tuple[int, ...], tuple[int, ...]] = {}
+    for tet in jax.device_get(tets):
+        vertices = [int(v) for v in tet]
+        for offsets in face_offsets:
+            face = tuple(vertices[o] for o in offsets)
+            key = tuple(sorted(face))
+            face_counts[key] = face_counts.get(key, 0) + 1
+            face_table[key] = face
+
+    triangles = [face_table[key] for key, count in face_counts.items() if count == 1]
+    triangles.sort()
+
+    edges = set()
+    for a, b, c in triangles:
+        for u, v in ((a, b), (b, c), (c, a)):
+            edges.add((min(u, v), max(u, v)))
+
+    surface_vertices = sorted({v for triangle in triangles for v in triangle})
+
+    return (
+        jnp.asarray(triangles, dtype=jnp.int32).reshape(-1, 3),
+        jnp.asarray(sorted(edges), dtype=jnp.int32).reshape(-1, 2),
+        jnp.asarray(surface_vertices, dtype=jnp.int32).reshape(-1),
+    )
+
+
 def build_lumped_masses(rest_positions: jnp.ndarray, tets: jnp.ndarray):
     """Build per-vertex lumped masses from tet rest volumes with density 1."""
     masses = jnp.zeros((rest_positions.shape[0],), dtype=rest_positions.dtype)

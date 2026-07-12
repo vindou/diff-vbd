@@ -1,0 +1,89 @@
+# Two soft blocks: a fixed lower one, a free upper one dropped onto it.
+#
+# This is the mesh-mesh path. There are NO analytic colliders here -- every contact force in
+# the run comes from surface primitives of one body meeting surface primitives of the other,
+# through the same barrier, the same friction model and the same time-of-impact filter that a
+# plane collider would use.
+#
+# `self_collision: true` is what turns that path on. It also detects the mesh against *itself*,
+# which is the same machinery: the pair list simply does not care whether the two primitives
+# belong to the same connected component.
+#
+# Generate the mesh assets first (they are gitignored, being binary), then run:
+#
+#     python examples/make_two_blocks.py
+#     diff-vbd --config examples/two_blocks.yaml --platform cpu --precision float64
+#
+# float64 is not optional. See the contact section of the README.
+
+mesh:
+  path: two_blocks.msh
+
+material:
+  mu: 5.0e2
+  lam: 5.0e2
+  density: 1.0
+
+simulation:
+  steps: 40
+
+solver:
+  dt: 0.005
+  num_iterations: 10
+  eps: 1.0e-8
+  acceleration:
+    enabled: false
+    rho: 0.95
+  line_search:
+    enabled: true
+    num_alphas: 9
+
+contact:
+  enabled: true
+  d_hat: 1.0e-3
+  friction_mu: 0.3
+  eps_v: 1.0e-4
+
+  self_collision: true      # detect the surface against itself and against the other body
+
+  # The intersection-free guarantee for mesh-mesh contact. Leave it on.
+  #
+  # Turning it off makes mesh-mesh a barrier *penalty* only: two surfaces driven together hard
+  # enough will pass straight through each other, and nothing will say so. It exists because
+  # the guarantee's detection band grows with how fast the mesh is moving, and at high speed
+  # that gets expensive -- so it is a deliberate escape hatch, not a tuning knob. It warns.
+  self_collision_ccd: true
+
+  # Fixed-capacity pair buffers. Fixed because rebuilding them each step at the *same* shape
+  # is a jit cache hit, while a capacity that grew with the contact count would recompile the
+  # solver every single step. Overflow is a hard error that tells you what to raise it to --
+  # never a silent drop of whichever pairs happened to be last.
+  #
+  # `max_per_vertex` is a **direct linear multiplier on solve cost**, not merely a memory
+  # bound: every vertex evaluates all of its slots on every local solve -- of which there are
+  # (colours x sweeps) per step -- and the whole thing sits inside a Hessian. Measured on this
+  # mesh: 128 -> 9 s/step, 256 -> 19 s/step. Size it tightly.
+  #
+  # The overflow error names the exact number to use. Here the true maximum is 88: flat-on-flat
+  # contact between two coincident faces generates a large edge-edge fan at a single vertex.
+  # So 128 is the next sensible value with headroom.
+  #
+  # `capacity` (the whole pair buffer) is far cheaper -- it only feeds the time-of-impact
+  # filter, which is a shallow kernel. Give that one room.
+  capacity: 1024
+  max_per_vertex: 128
+
+body_force:
+  - 0.0
+  - 0.0
+  - -9.81
+
+# The lower block is the table. Everything else is held up by contact alone.
+dirichlet:
+  - selector: table
+    mode: position
+    components: ["0.0", "0.0", "0.0"]
+
+selectors:
+  table:
+    path: two_blocks_table.stl

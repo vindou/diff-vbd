@@ -141,6 +141,82 @@ class MaterialParams:
 
 
 @pytree_dataclass
+class ColliderData:
+    """Analytic rigid colliders, one row per collider.
+
+    Every collider carries every parameter and the unused ones are ignored, which keeps
+    the buffers rectangular and the shapes static. ``kind`` is an int32 code rather than a
+    string: every field of a ``pytree_dataclass`` is a traced leaf, and a string leaf is a
+    hard jit failure the moment the problem reaches a jitted function.
+    """
+
+    kind: jnp.ndarray  # (K,) int32, see contact.colliders.COLLIDER_KINDS
+    normal: jnp.ndarray  # (K, 3) plane normal, pointing into the free half-space
+    offset: jnp.ndarray  # (K,) plane offset
+    center: jnp.ndarray  # (K, 3) sphere centre
+    radius: jnp.ndarray  # (K,) sphere radius
+    outside: jnp.ndarray  # (K,) bool: stay outside the sphere, rather than inside
+    enabled: jnp.ndarray  # (K,) bool
+
+
+@pytree_dataclass
+class ContactParams:
+    d_hat: jnp.ndarray  # activation distance, in length units
+    kappa: jnp.ndarray  # barrier stiffness
+    friction_mu: jnp.ndarray  # Coulomb coefficient
+    eps_v: jnp.ndarray  # friction static/dynamic transition velocity
+    use_barrier: jnp.ndarray  # bool: IPC log barrier, else quadratic penalty
+    enabled: jnp.ndarray  # bool
+
+
+@pytree_dataclass
+class ContactState:
+    """The frozen output of the combinatorial layer: rebuilt each detection.
+
+    Every array is fixed-shape and padded. Rebuilding this each step with fresh contents of
+    the same shape is a jit cache hit; a changing capacity is a full recompile of the solver
+    every step, so the capacity is chosen once and overflow is an error.
+
+    All of it is integer- or mask-valued and none of it is ever differentiated. Capacity is
+    read from ``.shape``, never stored as an int field -- an int field on a pytree_dataclass
+    becomes a *tracer* and cannot size an array.
+    """
+
+    pair_vertices: jnp.ndarray  # (C, 4) int32; vertex-triangle uses [v, t0, t1, t2]
+    pair_type: jnp.ndarray  # (C,) int32, see contact.detection.PAIR_TYPES
+    pair_valid: jnp.ndarray  # (C,) bool
+    incident_contacts: jnp.ndarray  # (N, K) int32, pair indices touching each vertex
+    incident_contact_mask: jnp.ndarray  # (N, K) bool
+
+
+@pytree_dataclass
+class CcdParams:
+    """The parameters of the mesh-mesh intersection-free guarantee.
+
+    ``max_displacement`` and ``detection_band`` are **refreshed every step** (they depend on
+    how fast the mesh is currently moving) and they are a matched pair: the band is only large
+    enough to make the pair set complete *because* the clamp stops any vertex leaving it. They
+    are derived together, in one place, so they cannot drift apart -- and they live here, as
+    array leaves, so rebuilding them each step is a jit cache hit rather than a recompile.
+    """
+
+    slack: jnp.ndarray  # fraction of the gap a step may consume, in (0, 1)
+    max_displacement: jnp.ndarray  # Δmax: how far a vertex may stray from the step start
+    detection_band: jnp.ndarray  # the radius the pair set was built with
+    enabled: jnp.ndarray  # bool: the mesh-mesh guarantee (colliders are always filtered)
+
+
+@pytree_dataclass
+class ContactData:
+    params: ContactParams
+    colliders: ColliderData
+    state: ContactState
+    ccd: CcdParams
+    surface_triangles: jnp.ndarray  # (F, 3) int32, global indices, outward wound
+    surface_edges: jnp.ndarray  # (E, 2) int32, global indices
+
+
+@pytree_dataclass
 class AccelerationOptions:
     enabled: jnp.ndarray
     chebyshev_rho: jnp.ndarray
@@ -169,6 +245,7 @@ class SimulationProblem:
     boundary_conditions: BoundaryConditions
     material: MaterialParams
     solver: SolverOptions
+    contact: ContactData
 
 
 @pytree_dataclass

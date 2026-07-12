@@ -74,6 +74,22 @@ class DirichletConfig:
 
 
 @dataclass(frozen=True)
+class ContactConfig:
+    enabled: bool
+    d_hat: float
+    kappa: float | None
+    friction_mu: float
+    eps_v: float
+    use_barrier: bool
+    self_collision: bool
+    self_collision_ccd: bool
+    ccd_slack: float
+    capacity: int
+    max_per_vertex: int
+    colliders: tuple[dict, ...]
+
+
+@dataclass(frozen=True)
 class ProblemConfig:
     mesh: MeshConfig
     selectors: dict[str, Path]
@@ -84,6 +100,7 @@ class ProblemConfig:
     body_force: tuple[float, float, float]
     dirichlet: tuple[DirichletConfig, ...]
     rigid: tuple[str, ...]
+    contact: ContactConfig
 
 
 def _require_mapping(data: Any, context: str) -> dict[str, Any]:
@@ -148,6 +165,11 @@ def _parse_mesh_config(data: Any, base_dir: Path) -> MeshConfig:
 
 
 def _parse_selectors_config(data: Any, base_dir: Path) -> dict[str, Path]:
+    # No selectors at all is legitimate now that contact exists: a body held up by a collider
+    # needs no Dirichlet region, and therefore no geometry to pick one out with.
+    if data is None:
+        return {}
+
     section = _require_mapping(data, "selectors")
     if not section:
         raise ValueError("selectors must define at least one selector")
@@ -290,6 +312,53 @@ def _parse_line_search_config(data: Any) -> LineSearchConfig:
     return LineSearchConfig(enabled=enabled_raw, alphas=alphas)
 
 
+def _parse_contact_config(data: Any) -> ContactConfig:
+    """Parse the optional `contact` block. Absent means no contact at all."""
+    if data is None:
+        return ContactConfig(
+            enabled=False,
+            d_hat=1.0e-3,
+            kappa=None,
+            friction_mu=0.0,
+            eps_v=1.0e-3,
+            use_barrier=True,
+            self_collision=False,
+            self_collision_ccd=True,
+            ccd_slack=0.9,
+            capacity=4096,
+            max_per_vertex=192,
+            colliders=(),
+        )
+
+    section = _require_mapping(data, "contact")
+    colliders = []
+    for index, spec in enumerate(section.get("colliders", ()) or ()):
+        collider = _require_mapping(spec, f"contact.colliders[{index}]")
+        colliders.append(dict(collider))
+
+    kappa = section.get("kappa")
+    return ContactConfig(
+        enabled=bool(section.get("enabled", True)),
+        d_hat=_require_float(section.get("d_hat", 1.0e-3), "contact.d_hat"),
+        kappa=None if kappa is None else _require_float(kappa, "contact.kappa"),
+        friction_mu=_require_float(
+            section.get("friction_mu", 0.0), "contact.friction_mu"
+        ),
+        eps_v=_require_float(section.get("eps_v", 1.0e-3), "contact.eps_v"),
+        use_barrier=bool(section.get("use_barrier", True)),
+        self_collision=bool(section.get("self_collision", False)),
+        self_collision_ccd=bool(section.get("self_collision_ccd", True)),
+        ccd_slack=_require_float(
+            section.get("ccd_slack", 0.9), "contact.ccd_slack"
+        ),
+        capacity=_require_int(section.get("capacity", 4096), "contact.capacity"),
+        max_per_vertex=_require_int(
+            section.get("max_per_vertex", 192), "contact.max_per_vertex"
+        ),
+        colliders=tuple(colliders),
+    )
+
+
 def _parse_simulation_config(data: Any) -> SimulationConfig:
     section = _require_mapping(data, "simulation")
     steps = _require_int(section.get("steps"), "simulation.steps")
@@ -386,8 +455,14 @@ def load_config(path: str | Path) -> ProblemConfig:
     )
     dirichlet = _parse_dirichlet_config(raw_config.get("dirichlet"), set(selectors))
     rigid = _parse_rigid_config(raw_config.get("rigid"), set(selectors))
-    if not dirichlet and not rigid:
-        raise ValueError("config must define at least one dirichlet or rigid constraint")
+    contact = _parse_contact_config(raw_config.get("contact"))
+    # A body supported by a collider needs no kinematic constraint at all.
+    supported_by_contact = contact.enabled and bool(contact.colliders)
+    if not dirichlet and not rigid and not supported_by_contact:
+        raise ValueError(
+            "config must define at least one dirichlet or rigid constraint "
+            "(or a contact collider to support the body)"
+        )
 
     return ProblemConfig(
         mesh=mesh,
@@ -399,6 +474,7 @@ def load_config(path: str | Path) -> ProblemConfig:
         body_force=body_force,
         dirichlet=dirichlet,
         rigid=rigid,
+        contact=contact,
     )
 
 
@@ -462,4 +538,16 @@ def load_problem_from_yaml(
         # Both None is fine: assemble_problem then builds its default linear grid.
         line_search_alphas=config.solver.line_search.alphas,
         line_search_num_alphas=config.solver.line_search.num_alphas,
+        colliders=list(config.contact.colliders) or None,
+        contact_d_hat=config.contact.d_hat,
+        contact_kappa=config.contact.kappa,
+        contact_friction_mu=config.contact.friction_mu,
+        contact_eps_v=config.contact.eps_v,
+        contact_use_barrier=config.contact.use_barrier,
+        contact_enabled=config.contact.enabled,
+        self_collision=config.contact.self_collision,
+        self_collision_ccd=config.contact.self_collision_ccd,
+        ccd_slack=config.contact.ccd_slack,
+        contact_capacity=config.contact.capacity,
+        contact_max_per_vertex=config.contact.max_per_vertex,
     )

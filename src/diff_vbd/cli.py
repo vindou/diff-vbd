@@ -68,6 +68,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional XLA GPU memory fraction override.",
     )
     parser.add_argument(
+        "--precision",
+        choices=("float32", "float64"),
+        default="float32",
+        help=(
+            "Floating point precision. Contact needs float64: the barrier resolves a gap "
+            "far smaller than the mesh coordinates, and in float32 a small positive gap "
+            "can round negative and produce NaN. Default: float32."
+        ),
+    )
+    parser.add_argument(
         "--config",
         type=Path,
         help="Path to the YAML simulation config.",
@@ -100,6 +110,7 @@ def main() -> int:
             None if args.gpu_preallocate is None else args.gpu_preallocate == "true"
         ),
         gpu_mem_fraction=args.gpu_mem_fraction,
+        precision=args.precision,
     )
     from diff_vbd import (
         DirichletSpec,
@@ -145,7 +156,10 @@ def main() -> int:
         )
     _log_stage(4, total_stages, "Building simulation problem and initial state")
     _log_stage_detail(4, total_stages, f"Loading tet mesh from {config.mesh.path}")
-    rest_positions, tets = parse_gmsh22_binary_tets(config.mesh.path)
+    import jax.numpy as _jnp
+
+    mesh_dtype = _jnp.float64 if args.precision == "float64" else _jnp.float32
+    rest_positions, tets = parse_gmsh22_binary_tets(config.mesh.path, dtype=mesh_dtype)
     _log_stage_detail(
         4,
         total_stages,
@@ -252,6 +266,18 @@ def main() -> int:
         # Both None is fine: assemble_problem then builds its default linear grid.
         line_search_alphas=config.solver.line_search.alphas,
         line_search_num_alphas=config.solver.line_search.num_alphas,
+        colliders=list(config.contact.colliders) or None,
+        contact_d_hat=config.contact.d_hat,
+        contact_kappa=config.contact.kappa,
+        contact_friction_mu=config.contact.friction_mu,
+        contact_eps_v=config.contact.eps_v,
+        contact_use_barrier=config.contact.use_barrier,
+        contact_enabled=config.contact.enabled,
+        self_collision=config.contact.self_collision,
+        contact_capacity=config.contact.capacity,
+        self_collision_ccd=config.contact.self_collision_ccd,
+        ccd_slack=config.contact.ccd_slack,
+        contact_max_per_vertex=config.contact.max_per_vertex,
     )
     _log_stage_detail(
         4,

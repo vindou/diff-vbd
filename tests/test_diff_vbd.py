@@ -419,10 +419,20 @@ class DiffVbdTests(unittest.TestCase):
         vertex_index = jnp.array(1, dtype=jnp.int32)
         x_i_iter = state.position[vertex_index]
         gradient = vertex_local_gradient(
-            problem, state.position, inertial_target, vertex_index, x_i_iter
+            problem,
+            state.position,
+            inertial_target,
+            state.position,
+            vertex_index,
+            x_i_iter,
         )
         hessian = vertex_local_hessian(
-            problem, state.position, inertial_target, vertex_index, x_i_iter
+            problem,
+            state.position,
+            inertial_target,
+            state.position,
+            vertex_index,
+            x_i_iter,
         )
         regularized_hessian = hessian + problem.solver.eps * jnp.eye(
             x_i_iter.shape[0], dtype=x_i_iter.dtype
@@ -432,6 +442,7 @@ class DiffVbdTests(unittest.TestCase):
             problem,
             state.position,
             inertial_target,
+            state.position,
             vertex_index,
         )
         self.assertTrue(jnp.allclose(actual, expected))
@@ -447,10 +458,20 @@ class DiffVbdTests(unittest.TestCase):
         vertex_index = jnp.array(1, dtype=jnp.int32)
         x_i_iter = state.position[vertex_index]
         gradient = vertex_local_gradient(
-            problem, state.position, inertial_target, vertex_index, x_i_iter
+            problem,
+            state.position,
+            inertial_target,
+            state.position,
+            vertex_index,
+            x_i_iter,
         )
         hessian = vertex_local_hessian(
-            problem, state.position, inertial_target, vertex_index, x_i_iter
+            problem,
+            state.position,
+            inertial_target,
+            state.position,
+            vertex_index,
+            x_i_iter,
         )
         regularized_hessian = hessian + problem.solver.eps * jnp.eye(
             x_i_iter.shape[0], dtype=x_i_iter.dtype
@@ -460,6 +481,7 @@ class DiffVbdTests(unittest.TestCase):
             problem,
             state.position,
             inertial_target,
+            state.position,
             vertex_index,
         )
         self.assertTrue(jnp.allclose(actual, expected))
@@ -475,10 +497,20 @@ class DiffVbdTests(unittest.TestCase):
         vertex_index = jnp.array(1, dtype=jnp.int32)
         x_i_iter = state.position[vertex_index]
         gradient = vertex_local_gradient(
-            problem, state.position, inertial_target, vertex_index, x_i_iter
+            problem,
+            state.position,
+            inertial_target,
+            state.position,
+            vertex_index,
+            x_i_iter,
         )
         hessian = vertex_local_hessian(
-            problem, state.position, inertial_target, vertex_index, x_i_iter
+            problem,
+            state.position,
+            inertial_target,
+            state.position,
+            vertex_index,
+            x_i_iter,
         )
         regularized_hessian = hessian + problem.solver.eps * jnp.eye(
             x_i_iter.shape[0], dtype=x_i_iter.dtype
@@ -488,7 +520,12 @@ class DiffVbdTests(unittest.TestCase):
         candidate_positions = x_i_iter[None, :] + alphas[:, None] * delta_x[None, :]
         candidate_objectives = jax.vmap(
             lambda candidate: vertex_local_objective(
-                problem, state.position, inertial_target, vertex_index, candidate
+                problem,
+                state.position,
+                inertial_target,
+                state.position,
+                vertex_index,
+                candidate,
             )
         )(candidate_positions)
         expected = candidate_positions[jnp.argmin(candidate_objectives)]
@@ -496,6 +533,7 @@ class DiffVbdTests(unittest.TestCase):
             problem,
             state.position,
             inertial_target,
+            state.position,
             vertex_index,
         )
 
@@ -1524,7 +1562,7 @@ class LineSearchDescentTests(unittest.TestCase):
 
         def objective(vertex_index, x_i):
             return vertex_local_objective(
-                problem, state.position, target, vertex_index, x_i
+                problem, state.position, target, state.position, vertex_index, x_i
             )
 
         increased = 0
@@ -1534,7 +1572,7 @@ class LineSearchDescentTests(unittest.TestCase):
             after = objective(
                 vertex_index,
                 solve_local_vertex_step(
-                    problem, state.position, target, vertex_index
+                    problem, state.position, target, state.position, vertex_index
                 ),
             )
             if float(after) > float(before) + 1.0e-4 * abs(float(before)) + 1.0e-6:

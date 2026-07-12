@@ -1,0 +1,50 @@
+# A soft block dropped onto a rigid ground plane.
+#
+# Note there is no `dirichlet` block: the body is held up entirely by contact. Resting on
+# the ground is a perfectly well-posed problem, so a kinematic constraint is not required
+# once a collider can supply the support.
+#
+# Contact wants float64. The barrier resolves a gap orders of magnitude smaller than the
+# mesh coordinates, and it gets that gap by subtracting them -- in float32 a small positive
+# gap can round to zero or below, and log(gap / d_hat) is then NaN. Run with:
+#
+#     diff-vbd --config examples/block_on_plane.yaml --platform cpu --precision float64
+
+mesh:
+  path: beam.msh
+
+material:
+  mu: 5.0e3
+  lam: 5.0e3
+  density: 1.0
+
+simulation:
+  steps: 200
+
+solver:
+  dt: 0.005
+  num_iterations: 25
+  eps: 1.0e-8
+  acceleration:
+    enabled: false
+    rho: 0.95
+  line_search:
+    enabled: true
+    num_alphas: 9
+
+contact:
+  enabled: true
+  d_hat: 1.0e-3          # activation distance: the barrier turns on inside this gap
+  # kappa: 1.0e3         # omit to derive a stiffness matched to the inertia term
+  friction_mu: 0.3       # Coulomb coefficient; 0 for frictionless
+  eps_v: 1.0e-4          # sliding speed below which a contact is treated as stuck
+  self_collision: false  # enable to also detect the mesh against itself
+  colliders:
+    - kind: plane
+      normal: [0.0, 0.0, 1.0]   # points into the free half-space
+      offset: 0.0               # the plane is {x : dot(normal, x) == offset}
+
+body_force:
+  - 0.0
+  - 0.0
+  - -9.81
