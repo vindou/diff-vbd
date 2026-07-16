@@ -51,6 +51,36 @@ There are **two drivers over the same kernels**, and a caller should pick delibe
   data, not control flow: an unconverged element reports ``converged=False`` and its
   adjoint is **NaN**, never an exception mid-batch; ``assert_converged`` restores the
   loud version at a batch boundary.
+
+**The batched caller's contract.** Near contact, this Newton iteration has zigzag
+stall pockets: parameter values where the residual plateaus around 1e-9 instead of
+converging quadratically. Their *propensity* is systematic (stall probability rises
+~4x with indentation depth and with barrier stiffness) but their *trigger* is a
+last-ulp lottery (which points stall is nearly uncorrelated across compilations of the
+same math -- eager vs vmap vs another machine). Measured tables are in RESULTS.md;
+what they mean for a caller:
+
+* ``max_iterations`` is not a safety margin under ``vmap`` -- it is a price every
+  healthy lane pays for the worst one, because a batched while_loop runs until its
+  slowest element stops. Healthy solves here take 10-14 iterations; a budget of 100
+  makes one stalled lane an ~8x tax on the whole batch. Set it tight and read the
+  certificate.
+* Read ``converged``. ``mean()`` over a batch with an unconverged lane is NaN -- that
+  is the refusal doing its job, not a bug to route around. At the measured 5-10%
+  per-lane stall rates, a B=128 batch contains at least one stalled lane with ~99.9%
+  probability, every step.
+* **Do not mask.** Dropping unconverged lanes and averaging the rest
+  (``sum(where(conv, g, 0)) / sum(conv)``) is biased: the dropped lanes
+  over-represent deep-indentation, stiff-barrier problems -- the informative end of a
+  load distribution -- with no symptom. Re-solve stalled lanes instead (the host
+  driver at a batch boundary, or a warm-started retry); their positions are good
+  starts, since a stalled solve has usually descended most of the way.
+* ``preconditioner="block_jacobi"`` roughly halves the eager stall rate and, in the
+  moderate-indentation regime, eliminates it -- switch it on for batched work -- but
+  it does not survive the vmap lottery everywhere, so it reduces the tax rather than
+  repealing the contract. Do not "keep the convergent subset and re-batch it":
+  certificates are per-(program, values), and re-batching survivors into a new batch
+  size recompiles the program and re-rolls the lottery (FINDINGS.md).
 """
 
 from __future__ import annotations
