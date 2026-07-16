@@ -59,6 +59,13 @@ def main():
             problem, tol=_TOL, initial_position=initial, max_iterations=_MAX_ITERATIONS
         )
 
+    def solve_one_traced_bj(params):
+        problem = apply_static_params(template, params)
+        return solve_static_equilibrium_traced(
+            problem, tol=_TOL, initial_position=initial,
+            max_iterations=_MAX_ITERATIONS, preconditioner="block_jacobi",
+        )
+
     print(f"mesh: {positions.shape[0]} vertices, "
           f"{int(np.sum(np.asarray(positions)[:, 2] > 1e-9)) * 3} free DOF; "
           f"tol={_TOL:g}, max_iterations={_MAX_ITERATIONS}, best of {_REPEATS}")
@@ -108,10 +115,24 @@ def main():
             )
             for b in range(batch_size)
         )
+
+        # -- traced + block-Jacobi: the M3 variant, same protocol --------------------
+        solve_batch_bj = jax.jit(jax.vmap(solve_one_traced_bj))
+        bj = solve_batch_bj(batch)
+        bj.position.block_until_ready()
+        bj_best = np.inf
+        for _ in range(_REPEATS):
+            t0 = time.perf_counter()
+            bj = solve_batch_bj(batch)
+            bj.position.block_until_ready()
+            bj_best = min(bj_best, time.perf_counter() - t0)
+        bj_converged = int(np.sum(np.asarray(bj.converged)))
+
         print(f"{batch_size:>4} {host_best:>14.3f} {traced_best:>16.3f} "
               f"{host_best / batch_size:>13.4f} {traced_best / batch_size:>15.4f} "
               f"{host_best / traced_best:>7.2f}x {traced_converged:>3}/{host_converged:<3} "
-              f"{compile_and_first:>12.1f}")
+              f"{compile_and_first:>12.1f}   "
+              f"bj: {bj_best:>7.3f}s {host_best / bj_best:>5.2f}x {bj_converged:>3}/{batch_size}")
         if worst_rel > 1e-8:
             print(f"     [!] worst traced-vs-host position rel diff {worst_rel:.1e} "
                   f"(expected ~tol/lambda_min for elements stopping at different "
@@ -121,23 +142,42 @@ def main():
     # The random draw above hits zigzag stall pockets (FINDINGS.md): one lane running
     # to max_iterations drags the whole batch through that many masked passes, so the
     # per-solve number above conflates masking overhead with stall drag. This batch is
-    # the gate tests' 15 pairs verified to converge on both drivers in 10-14 iterations.
-    from test_static_traced import _BATCH_PAIRS, _center_at
+    # the largest draw's own survivors -- the lanes whose `converged` certificate holds
+    # on BOTH drivers -- discovered at runtime, so the measurement is portable rather
+    # than pinned to the authoring machine's pocket geography. It is also exactly the
+    # sample a masking caller would keep, so this row is the honest ceiling of the
+    # mask-and-batch strategy on this hardware.
+    solve_batch_full = jax.jit(jax.vmap(solve_one_traced))
+    full_batch = StaticParams(mu=jnp.asarray(all_mus))
+    full = solve_batch_full(full_batch)
+    host_converged_mask = []
+    for b in range(len(all_mus)):
+        result = solve_static_equilibrium(
+            apply_static_params(template, StaticParams(mu=jnp.asarray(all_mus[b]))),
+            tol=_TOL,
+            initial_position=initial,
+            max_iterations=_MAX_ITERATIONS,
+        )
+        host_converged_mask.append(bool(result.converged))
+    survivors = [
+        b
+        for b in range(len(all_mus))
+        if host_converged_mask[b] and bool(full.converged[b])
+    ]
+    if len(survivors) < 2:
+        print(f"\nstall-free batch skipped: only {len(survivors)} survivor lanes")
+        return
 
-    mus = jnp.asarray([mu for mu, _ in _BATCH_PAIRS])
-    centers = jnp.asarray(np.stack([_center_at(dz) for _, dz in _BATCH_PAIRS]))
-    batch = StaticParams(mu=mus, collider_center=centers)
-    batch_size = len(_BATCH_PAIRS)
+    survivor_mus = jnp.asarray(all_mus[survivors])
+    batch = StaticParams(mu=survivor_mus)
+    batch_size = len(survivors)
 
     host_best = np.inf
     for _ in range(_REPEATS):
         t0 = time.perf_counter()
         for b in range(batch_size):
             solve_static_equilibrium(
-                apply_static_params(
-                    template,
-                    StaticParams(mu=mus[b], collider_center=centers[b]),
-                ),
+                apply_static_params(template, StaticParams(mu=survivor_mus[b])),
                 tol=_TOL,
                 initial_position=initial,
                 max_iterations=_MAX_ITERATIONS,
@@ -154,8 +194,8 @@ def main():
         batched.position.block_until_ready()
         traced_best = min(traced_best, time.perf_counter() - t0)
     converged = int(np.sum(np.asarray(batched.converged)))
-    print(f"\nstall-free pinned batch (B={batch_size}, all lanes 10-14 iterations): "
-          f"host {host_best:.3f}s, traced {traced_best:.3f}s, "
+    print(f"\nstall-free survivor batch (B={batch_size} of {len(all_mus)} draw lanes "
+          f"converged on both drivers): host {host_best:.3f}s, traced {traced_best:.3f}s, "
           f"speedup {host_best / traced_best:.2f}x, converged {converged}/{batch_size}")
 
 

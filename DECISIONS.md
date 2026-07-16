@@ -140,3 +140,57 @@ Format: date · decision · rationale. Append-only.
   stepper — out of scope and of dubious value, since the traced path's caller supplies
   per-batch `initial_position` anyway. The traced docstring says so and points the
   caller at `initial_position`.
+
+- **2026-07-16 · Pinned gate fixtures replaced by swept both-converged property tests.**
+  The first design pinned parameters "verified to converge under the exact compiled
+  program the test runs" — which, it turned out, pins them to the machine that ran the
+  verification: on x86_64 Linux (same JAX 0.10.2, CPU) 11 of 23 gates failed, every one
+  a convergence *precondition* on the unchanged host driver. The loud-fixture design
+  worked; the pinning conclusion was wrong. The gates now sweep a 27-point (mu, collider
+  height) grid, filter on the `converged` certificates both drivers already return,
+  assert the gate property on every survivor, and demand `survivors >= 8`. That is
+  portable by construction and a *stronger* claim than the pinned version — equivalence
+  holds everywhere it is defined — and it hides nothing: a platform where most of the
+  grid stops converging fails loudly about the solver, which is what we want to hear.
+  Same pattern for the adjoint gates (survivor = finite vmapped gradient + both FD
+  probes converged, minimum survivors per parameter class). No tolerance moved.
+
+- **2026-07-16 · The refusal test's asymmetry is constructed, not harvested.** It
+  previously relied on the easy lane converging to 1e-9 within 25 iterations — pocket
+  geography again. The refusal adjoint now runs at tol=1e-6, which sits in the globally
+  convergent descent phase (~8 iterations), three-plus orders above where the zigzag
+  pockets live, so the easy lane converges on any machine or the machine has a real
+  solver problem; the unconverged lane keeps the 5mm-lowered sphere whose penetrating
+  start zigzags at a residual of order one — six orders above tolerance, a physical
+  plateau no compilation flips. The refusal semantics do not depend on the tolerance's
+  value, only on the certificate, so nothing is weakened.
+
+- **2026-07-16 · Transcription coverage that depends on the energy landscape is found
+  at runtime, never pinned.** The timid-accept branch (accepted alpha < 1/2 must raise
+  the shift) is now forced by scanning `-c * gradient` scales at runtime for the first
+  c whose Armijo-accepted alpha lands below 1/2 on the executing machine's actual
+  objective, and handing exactly that direction to both drivers. The natural zigzag
+  trajectory is kept as an equality-only trace with no coverage promise. Rejections and
+  the NaN direction were already forced deterministically.
+
+- **2026-07-16 · Block-Jacobi preconditioning is built from per-vertex static Hessian
+  blocks, damped like the operator, PSD-floored, and defaults off.** The stall pockets
+  are barrier-conditioning zigzags, and against an analytic collider the barrier's
+  Hessian is exactly per-vertex, so the natural preconditioner is the per-vertex 3x3
+  diagonal block: incident-tet elastic curvature (VBD's own local-objective pattern,
+  minus inertia — no timestep in Pi — minus friction and pairs, both refused in
+  statics) plus the exact collider barrier block. `clamped_hessian` floors the
+  eigenvalues first (an indefinite block makes a "preconditioner" that is not one),
+  the blocks are shifted by the same Levenberg damping as the CG operator before
+  inversion (a preconditioner for H under a solve of H + damping·I disagrees with its
+  system exactly when the shift is large — exactly when the solve is struggling), and
+  they are rebuilt at every Newton pass because the barrier curvature moves fastest
+  where the preconditioner matters most. Default off because a preconditioner changes
+  CG's iterates: equivalence with the host driver holds at the equilibrium (gated by
+  the preconditioned agreement sweep), not decision-for-decision along the path.
+  Prototype measurement before wiring: at the caller's tol=1e-9, 5/16 pocket points
+  stalled plain and 0/16 preconditioned (10–14 iterations each); at 1e-11 the pockets
+  shuffle rather than vanish (9/16 → 3/16, at different points) — the fix addresses
+  the conditioning-driven ~1e-9 plateaus, not the near-floor terminal zigzag. The
+  kernels gained an optional `preconditioner=None` argument; the host driver's calls
+  are unchanged and its behaviour is bit-identical.

@@ -66,6 +66,8 @@ from diff_vbd.model import SimulationProblem
 from diff_vbd.pytree import pytree_dataclass
 from diff_vbd.setup.boundary_conditions import evaluate_dirichlet_targets
 from diff_vbd.solver.contact.ccd import vertex_time_of_impact
+from diff_vbd.solver.contact.potential import collider_contact_energy
+from diff_vbd.solver.materials import tet_energy
 from diff_vbd.solver.potential import potential_energy
 
 
@@ -222,8 +224,68 @@ def _hvp_at(problem, pinned, free, u, v):
     return jax.jvp(lambda w: _gradient(problem, pinned, free, w), (u,), (v,))[1]
 
 
+@jax.jit
+def _vertex_static_objective(problem, positions, vertex_index, x_i):
+    """The energy one vertex's displacement controls: incident tets plus its barrier.
+
+    ``vbd.vertex_local_objective``'s accumulation, minus the terms statics does not
+    have: no inertia (there is no timestep in ``Pi``), no friction (refused -- not the
+    gradient of any potential), no mesh pairs (self-collision refused). The body force
+    is linear in ``x_i`` and contributes zero curvature, so it is omitted from a
+    function that exists only to be twice-differentiated. What matters is that the
+    terms present are exactly ``static_potential``'s restriction to this vertex: a
+    preconditioner built from a *different* energy would fight the objective the
+    solver is actually descending.
+    """
+    vertex_incident_tets = problem.topology.incident_tets[vertex_index]
+    vertex_incident_mask = problem.topology.incident_mask[vertex_index]
+
+    def incident_tet_energy(tet_index):
+        tet_vertices = problem.mesh.tets[tet_index]
+        tet_positions = positions[tet_vertices]
+        local_vertex = jnp.argmax((tet_vertices == vertex_index).astype(jnp.int32))
+        tet_positions = tet_positions.at[local_vertex].set(x_i)
+        rest_tet_positions = problem.mesh.rest_positions[tet_vertices]
+        return tet_energy(problem.material, rest_tet_positions, tet_positions)
+
+    elastic_energies = jax.vmap(incident_tet_energy)(vertex_incident_tets)
+    elastic = jnp.sum(
+        elastic_energies * vertex_incident_mask.astype(elastic_energies.dtype)
+    )
+    contact = collider_contact_energy(
+        problem.contact.params, problem.contact.colliders, x_i
+    )
+    return elastic + contact
+
+
+_vertex_static_hessian = jax.jit(jax.hessian(_vertex_static_objective, argnums=3))
+
+
+@jax.jit
+def _free_vertex_blocks(problem, pinned, free, u):
+    """Per-free-vertex 3x3 diagonal blocks of the static Hessian, PSD-floored.
+
+    The stiffness that stalls CG is concentrated on the contacting vertices' own
+    diagonal blocks -- against an analytic collider the barrier's Hessian is *exactly*
+    per-vertex -- so block-Jacobi is the natural preconditioner and these blocks are
+    its whole content. ``clamped_hessian`` floors the eigenvalues first: the stable
+    Neo-Hookean energy is nonconvex, and an indefinite block makes a "preconditioner"
+    that is not one. Same floor VBD's local solves use, for the same reason.
+    """
+    # Imported here, not at module top: `solver.vbd` is a sibling with its own heavy
+    # import graph, and this module must stay importable before it (solver/__init__
+    # imports static first).
+    from diff_vbd.solver.vbd import clamped_hessian
+
+    x = pinned.at[free].set(u)
+    blocks = jax.vmap(lambda i: _vertex_static_hessian(problem, x, i, x[i]))(free)
+    return jax.vmap(lambda block: clamped_hessian(block, problem.solver.eps))(blocks)
+
+
 @partial(jax.jit, static_argnames=("maxiter",))
-def _newton_direction(problem, pinned, free, u, gradient, cg_tol, damping, maxiter):
+def _newton_direction(
+    problem, pinned, free, u, gradient, cg_tol, damping, maxiter, preconditioner=None
+):
     """Damped inexact-Newton direction: CG on matrix-free HVPs, H never assembled.
 
     ``damping`` is a Levenberg shift, in the Hessian's own units. It exists because a
@@ -234,23 +296,44 @@ def _newton_direction(problem, pinned, free, u, gradient, cg_tol, damping, maxit
     nowhere. The caller adapts the shift: large while steps are being rejected or cut,
     zero once the quadratic model is trustworthy, so terminal convergence is undamped
     Newton.
+
+    ``preconditioner``, if given, is the ``_free_vertex_blocks`` output: per-vertex
+    PSD-floored diagonal blocks of H. They are shifted by the *same* ``damping`` as
+    the operator before inversion -- a preconditioner for H fed to a solve of
+    H + damping*I disagrees with the system it preconditions exactly when the shift is
+    large, which is exactly when the solve is struggling.
     """
+    apply_preconditioner = None
+    if preconditioner is not None:
+        shifted = preconditioner + damping * jnp.eye(3, dtype=u.dtype)[None, :, :]
+        inverse_blocks = jnp.linalg.inv(shifted)
+        apply_preconditioner = lambda r: jnp.einsum("nij,nj->ni", inverse_blocks, r)
     direction, _ = jax.scipy.sparse.linalg.cg(
         lambda v: _hvp_at(problem, pinned, free, u, v) + damping * v,
         -gradient,
         tol=cg_tol,
         maxiter=maxiter,
+        M=apply_preconditioner,
     )
     return direction
 
 
 @partial(jax.jit, static_argnames=("maxiter",))
-def _adjoint_cg(problem, pinned, free, u_star, w, maxiter):
-    """Solve H lambda = w at the equilibrium, matrix-free."""
+def _adjoint_cg(problem, pinned, free, u_star, w, maxiter, preconditioner=None):
+    """Solve H lambda = w at the equilibrium, matrix-free.
+
+    ``preconditioner`` as in ``_newton_direction``, undamped: at a certified
+    equilibrium H is SPD and the blocks are inverted as they are.
+    """
+    apply_preconditioner = None
+    if preconditioner is not None:
+        inverse_blocks = jnp.linalg.inv(preconditioner)
+        apply_preconditioner = lambda r: jnp.einsum("nij,nj->ni", inverse_blocks, r)
     lam, _ = jax.scipy.sparse.linalg.cg(
         lambda v: _hvp_at(problem, pinned, free, u_star, v),
         w,
         maxiter=maxiter,
+        M=apply_preconditioner,
     )
     return lam
 
@@ -599,7 +682,15 @@ _DAMPING_CEILING = 1.0e6  # a rejection at this shift means stagnation, not retr
 _DAMPING_SNAP_TO_ZERO = 1.0e-7  # decayed below this, the shift is plain-Newton again
 
 
-def _traced_newton_step(problem, pinned, free, initial_residual, cg_max_iterations, carry):
+def _traced_newton_step(
+    problem,
+    pinned,
+    free,
+    initial_residual,
+    cg_max_iterations,
+    carry,
+    use_block_jacobi=False,
+):
     """One pass of the traced Newton loop: the host loop's body, as pure data flow.
 
     Module-level and driven one pass at a time by the transcription test in
@@ -626,6 +717,13 @@ def _traced_newton_step(problem, pinned, free, initial_residual, cg_max_iteratio
     curvature_scale = jnp.linalg.norm(
         _hvp_at(problem, pinned, free, u, gradient)
     ) / jnp.maximum(residual, 1e-300)
+    # `use_block_jacobi` is a trace-time constant. The blocks are rebuilt at every
+    # pass, deliberately: the barrier curvature moves fastest exactly where the
+    # preconditioner is needed most, and a stale block near contact is worse than
+    # none.
+    preconditioner = (
+        _free_vertex_blocks(problem, pinned, free, u) if use_block_jacobi else None
+    )
     direction = _newton_direction(
         problem,
         pinned,
@@ -635,6 +733,7 @@ def _traced_newton_step(problem, pinned, free, initial_residual, cg_max_iteratio
         forcing,
         damping_rel * curvature_scale,
         maxiter=cg_max_iterations,
+        preconditioner=preconditioner,
     )
     # Truncated CG on an indefinite Hessian can hand back an ascent direction;
     # steepest descent is always available and always descends.
@@ -720,9 +819,19 @@ def _traced_newton_step(problem, pinned, free, initial_residual, cg_max_iteratio
     )
 
 
-@partial(jax.jit, static_argnames=("max_iterations", "cg_max_iterations"))
+@partial(
+    jax.jit,
+    static_argnames=("max_iterations", "cg_max_iterations", "use_block_jacobi"),
+)
 def _traced_newton_solve(
-    problem, pinned, free, u0, tol, max_iterations, cg_max_iterations
+    problem,
+    pinned,
+    free,
+    u0,
+    tol,
+    max_iterations,
+    cg_max_iterations,
+    use_block_jacobi=False,
 ):
     """The host Newton loop as a ``lax.while_loop``: pure, jit-able, vmappable.
 
@@ -775,7 +884,13 @@ def _traced_newton_solve(
 
     def newton_body(carry):
         return _traced_newton_step(
-            problem, pinned, free, initial_residual, cg_max_iterations, carry
+            problem,
+            pinned,
+            free,
+            initial_residual,
+            cg_max_iterations,
+            carry,
+            use_block_jacobi=use_block_jacobi,
         )
 
     u, _, residual, _, newton_iters, _, _ = jax.lax.while_loop(
@@ -807,6 +922,7 @@ def solve_static_equilibrium_traced(
     prescribed_position: jnp.ndarray | None = None,
     max_iterations: int = 100,
     cg_max_iterations: int = 250,
+    preconditioner: str = "none",
 ) -> StaticSolveResult:
     """``solve_static_equilibrium``, but pure and traceable: jit it, ``vmap`` it.
 
@@ -833,7 +949,22 @@ def solve_static_equilibrium_traced(
     gap, so every element of a batch needs a non-penetrating ``initial_position`` --
     one infeasible element does not poison its neighbours (the loop is masked
     per element), but it will burn the whole batch's wall-clock to ``max_iterations``.
+
+    ``preconditioner="block_jacobi"`` puts per-vertex 3x3 Hessian blocks
+    (``_free_vertex_blocks``) under both the Newton CG and, via
+    ``StaticAdjointTraced``, the adjoint CG. It targets the zigzag stall pockets --
+    barrier-dominated ill-conditioning that leaves the residual on a ~1e-9 plateau
+    while Armijo keeps accepting slivers -- and on the characterization grid at
+    tol=1e-9 it eliminated them (RESULTS.md). Default off: a preconditioner changes
+    CG's iterates, so equivalence with the host driver holds at the equilibrium (the
+    agreement gate checks exactly this) but not decision-for-decision along the path.
     """
+    if preconditioner not in ("none", "block_jacobi"):
+        raise ValueError(
+            f"unknown preconditioner {preconditioner!r}: expected 'none' or "
+            f"'block_jacobi'. This is a solver-behaviour switch, so misspellings must "
+            f"fail here rather than silently fall back to the default."
+        )
     _validate_static_problem(problem)
 
     if prescribed_position is None:
@@ -860,6 +991,7 @@ def solve_static_equilibrium_traced(
         jnp.asarray(tol, dtype=pinned.dtype),
         max_iterations=max_iterations,
         cg_max_iterations=cg_max_iterations,
+        use_block_jacobi=(preconditioner == "block_jacobi"),
     )
 
 
@@ -928,7 +1060,14 @@ class StaticAdjointTraced:
         max_iterations: int = 100,
         cg_max_iterations: int = 250,
         initial_position: jnp.ndarray | None = None,
+        preconditioner: str = "none",
     ):
+        if preconditioner not in ("none", "block_jacobi"):
+            raise ValueError(
+                f"unknown preconditioner {preconditioner!r}: expected 'none' or "
+                f"'block_jacobi'. This is a solver-behaviour switch, so misspellings "
+                f"must fail here rather than silently fall back to the default."
+            )
         _validate_static_problem(problem)
         self._template = problem
         self._tol = float(tol)
@@ -936,6 +1075,7 @@ class StaticAdjointTraced:
         self._max_iterations = max_iterations
         self._cg_max_iterations = cg_max_iterations
         self._initial_position = initial_position
+        self._preconditioner = preconditioner
         prescribed, _ = evaluate_dirichlet_targets(
             problem.boundary_conditions, 0.0, float(problem.solver.dt)
         )
@@ -960,6 +1100,7 @@ class StaticAdjointTraced:
             prescribed_position=self._pinned,
             max_iterations=self._max_iterations,
             cg_max_iterations=self._cg_max_iterations,
+            preconditioner=self._preconditioner,
         )
 
     # -- forward ---------------------------------------------------------------------
@@ -996,6 +1137,11 @@ class StaticAdjointTraced:
             u_star,
             w,
             maxiter=self._cg_max_iterations,
+            preconditioner=(
+                _free_vertex_blocks(problem, self._pinned, self._free, u_star)
+                if self._preconditioner == "block_jacobi"
+                else None
+            ),
         )
 
         template, pinned, free = self._template, self._pinned, self._free
