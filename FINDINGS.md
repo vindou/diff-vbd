@@ -113,3 +113,29 @@ Things noticed on the way that are not milestones. Append-only.
   scaled by 2^60) and the NaN direction via a wrapped `_newton_direction`; agreement is
   asserted bitwise, per pass. Seven further review findings were refuted by the
   adversarial verification panel (3 refuters per finding).
+
+- **2026-07-16 · (traced-static) Convergence certificates do not transfer between
+  compiled programs — re-batching a batch's own survivors flips lanes back into
+  stalls.** The benchmark took the 50 of 64 random-draw lanes whose `converged` held on
+  both drivers under the B=64 program, rebuilt them as a B=50 batch, and 7 of the 50
+  stalled under the new compilation. Same problems, same driver, same tolerance; the
+  only change was the batch size, hence the compiled program, hence the last-ulp
+  arithmetic the zigzag pockets key on. Consequence: "solve once, keep the convergent
+  subset, batch it tightly" is not a viable caller strategy — the subset's certificates
+  were issued by a program that no longer runs. Certificates are per-(program, values),
+  full stop.
+
+- **2026-07-16 · (traced-static) The stall pockets have a *systematic propensity* with
+  a *per-compilation trigger* — the exact combination that makes masking biased.** On a
+  135-point (mu, indentation, kappa) grid at tol=1e-9 (RESULTS.md for the tables):
+  stall probability rises ~4x with indentation (traced eager 4% -> 15%, traced vmap
+  4% -> 11%, shallow to deep) and with kappa in the eager context (4% -> 16%), so
+  stiffer contact problems are more likely to stall — but *which* grid points stall is
+  nearly uncorrelated between compilation contexts (Jaccard overlap 0.00-0.20 across
+  eager/vmap/host/preconditioned variants of the same math). A Monte-Carlo caller that
+  masks unconverged lanes (`sum(where(conv, g, 0))/sum(conv)`) therefore drops samples
+  preferentially from the deep-indentation, stiff-barrier end of its load distribution:
+  missing-not-at-random, estimate biased toward the easy regime, no symptom. Block-
+  Jacobi preconditioning halves the eager stall rate (10.4% -> 5.9%) but washes out
+  under vmap (7.4% -> 9.6%, within lottery noise), so it reduces the tax without
+  releasing the caller from reading `converged`.
