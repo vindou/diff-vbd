@@ -162,3 +162,11 @@ above is the sharp evidence, and re-running `hertz` scripts at h <= 0.025 (or on
 is the way to tighten it. The finite-depth correction could be removed analytically
 (Hayes-type bonded-layer factors) but that would be tuning the theory to the mesh
 rather than reporting the discrepancy.
+
+## Final verification
+
+`pytest -q` on the final tree: **198 passed, 271 subtests, 0 failed**, 1h05m wall on the
+development machine's CPU. The Hertz numbers above were re-captured on the final tree
+after the colouring fix and are identical to the digits shown (the static-settle
+protocol does not depend on the sweep order). The first full-suite run is what caught
+the colouring regression (FINDINGS.md) — the suite earned its keep on its own branch.
