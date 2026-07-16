@@ -280,15 +280,27 @@ class SweptAdjointUnderVmapTests(unittest.TestCase):
             max_iterations=_SWEEP_MAX_ITERATIONS,
             preconditioner="block_jacobi",
         )
+        # The rest-positions gate runs at 1e-9, not _ADJOINT_TOL: its FD signal is
+        # orders stronger than mu's (a whole-shape perturbation vs one scalar), so its
+        # stop-noise budget is comfortable at 1e-9 -- and 1e-10 sits deep enough in
+        # pocket territory that an x86_64 Linux compilation left only 1 of 5 sweep
+        # samples converged. Per-gate tolerance, each justified by its own noise
+        # budget; the gate itself (1e-4 vs central differences) never moves.
+        cls.rest_adjoint = StaticAdjointTraced(
+            cls.template,
+            tol=1.0e-9,
+            initial_position=cls.initial,
+            max_iterations=_SWEEP_MAX_ITERATIONS,
+        )
         cls.weights = jnp.asarray(
             np.random.default_rng(0).normal(size=cls.positions.shape)
         )
 
-    def _fd_solve(self, params, preconditioner="none"):
+    def _fd_solve(self, params, preconditioner="none", tol=_ADJOINT_TOL):
         problem = apply_static_params(self.template, params)
         return solve_static_equilibrium_traced(
             problem,
-            tol=_ADJOINT_TOL,
+            tol=tol,
             initial_position=self.initial,
             max_iterations=_SWEEP_MAX_ITERATIONS,
             preconditioner=preconditioner,
@@ -302,12 +314,15 @@ class SweptAdjointUnderVmapTests(unittest.TestCase):
         min_survivors,
         contact_active=True,
         preconditioner="none",
+        adjoint=None,
+        tol=_ADJOINT_TOL,
     ):
-        adjoint = (
-            self.preconditioned_adjoint
-            if preconditioner == "block_jacobi"
-            else self.adjoint
-        )
+        if adjoint is None:
+            adjoint = (
+                self.preconditioned_adjoint
+                if preconditioner == "block_jacobi"
+                else self.adjoint
+            )
         gradients = jax.vmap(
             jax.grad(
                 lambda v: jnp.sum(self.weights * adjoint(make_params(v)))
@@ -318,8 +333,8 @@ class SweptAdjointUnderVmapTests(unittest.TestCase):
             gradient = float(gradients[index])
             if not np.isfinite(gradient):
                 continue  # forward stalled under the vmapped program: not a survivor
-            plus = self._fd_solve(make_params(jnp.asarray(value + h)), preconditioner)
-            minus = self._fd_solve(make_params(jnp.asarray(value - h)), preconditioner)
+            plus = self._fd_solve(make_params(jnp.asarray(value + h)), preconditioner, tol)
+            minus = self._fd_solve(make_params(jnp.asarray(value - h)), preconditioner, tol)
             if not (bool(plus.converged) and bool(minus.converged)):
                 continue
             with self.subTest(value=value):
@@ -387,7 +402,9 @@ class SweptAdjointUnderVmapTests(unittest.TestCase):
     def test_rest_positions_directional(self):
         """Directional derivative along a fixed perturbation of the rest shape, one
         scale per swept sample (the full Jacobian would need 3N solves for its FD
-        twin). The direction leaves the clamped base untouched."""
+        twin). The direction leaves the clamped base untouched. Runs at 1e-9 (see
+        setUpClass: this gate's signal affords it, and 1e-10 starved the sweep to one
+        survivor on the Linux box)."""
         rest = np.asarray(self.positions)
         rng = np.random.default_rng(1)
         direction = rng.normal(size=rest.shape) * 0.01
@@ -397,9 +414,11 @@ class SweptAdjointUnderVmapTests(unittest.TestCase):
 
         self._check_swept(
             lambda s: StaticParams(rest_positions=rest + s * direction),
-            [0.002, 0.003, 0.004, 0.005, 0.006],
+            [0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.008],
             1e-5,
             min_survivors=2,
+            adjoint=self.rest_adjoint,
+            tol=1.0e-9,
         )
 
 
