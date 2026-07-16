@@ -11,8 +11,9 @@ biased, so the measurement has to separate rate-vs-parameter from location-vs-co
 Method: a grid over the three knobs that plausibly control conditioning — ``mu``
 (material stiffness), indentation depth (normal load, via the collider height, with a
 *per-depth* feasible start so every solve is legitimate), and ``kappa`` (barrier
-stiffness) — solved at the caller's tolerance in three compilation contexts: the
-traced driver eager, the traced driver under one big ``vmap``, and the host driver.
+stiffness) — solved at the caller's tolerance in five compilation contexts: the
+traced driver eager and under per-kappa ``vmap`` slices, each with and without the
+block-Jacobi preconditioner, plus the host driver.
 Reported per axis: stall rate marginals (the propensity question); across contexts:
 the overlap of stall *locations* (the lottery question).
 

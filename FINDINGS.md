@@ -128,9 +128,12 @@ Things noticed on the way that are not milestones. Append-only.
 - **2026-07-16 · (traced-static) The stall pockets have a *systematic propensity* with
   a *per-compilation trigger* — the exact combination that makes masking biased.** On a
   135-point (mu, indentation, kappa) grid at tol=1e-9 (RESULTS.md for the tables):
-  stall probability rises ~4x with indentation (traced eager 4% -> 15%, traced vmap
-  4% -> 11%, shallow to deep) and with kappa in the eager context (4% -> 16%), so
-  stiffer contact problems are more likely to stall — but *which* grid points stall is
+  stall probability rises with indentation in every unpreconditioned context (traced
+  eager 4% -> 15%, traced vmap 4% -> 11%, host 4% -> 7%, shallow to deep) and with
+  kappa in the eager context only (4% -> 16%; flat-to-falling elsewhere) — the event
+  counts per cell are small, so the finding is the direction's cross-context
+  consistency, not any one ratio. Deeper-indentation problems are more likely to
+  stall everywhere measured — but *which* grid points stall is
   nearly uncorrelated between compilation contexts (Jaccard overlap 0.00-0.20 across
   eager/vmap/host/preconditioned variants of the same math). A Monte-Carlo caller that
   masks unconverged lanes (`sum(where(conv, g, 0))/sum(conv)`) therefore drops samples
@@ -139,3 +142,33 @@ Things noticed on the way that are not milestones. Append-only.
   Jacobi preconditioning halves the eager stall rate (10.4% -> 5.9%) but washes out
   under vmap (7.4% -> 9.6%, within lottery noise), so it reduces the tax without
   releasing the caller from reading `converged`.
+
+- **2026-07-16 · (traced-static) The parent branch's M4 host-adjoint gates carry the
+  machine-pinning disease; measured, not inferred.** linbox01's full-suite run failed
+  exactly `StaticAdjointTests::{test_material_mu, test_material_lam, test_body_force}`
+  — parent-branch tests this branch never touched — and running the *parent commit's
+  own tree* on the same box reproduces all three with bit-identical assertion values
+  (adjoint 1.6496e-4 vs FD 1.6425e-4, 4.3e-3 relative against a 1e-4 gate). Mechanism:
+  the parent's `_check` runs its FD probes through the adjoint's forward without ever
+  checking their convergence, so a probe that stalls above tol on that machine's
+  compilation silently biases the difference quotient. The swept/filtered design in
+  `test_static_traced.py` is the fix pattern; applying it to the parent's gates is
+  left to the parent branch.
+
+- **2026-07-16 · (traced-static) Adversarial review round 2 (5 lenses, 3 refuters per
+  finding) confirmed one test gap, one contract trap, and a batch of documentation
+  drift; all fixed before the final commit.** The test gap: every preconditioned gate
+  asserted properties the plain path also satisfies, so a silently no-op'd
+  `preconditioner=` switch was undetectable — closed with a kernel-wiring test
+  (recording wrappers around `_free_vertex_blocks`/`_adjoint_cg`) and a behavioural
+  test (anisotropic blocks must change truncated-CG iterates). The contract trap:
+  `assert_converged(adjoint.solve_result(params))` reads certificates from a second
+  forward solve — a different compiled program than the one that produced the
+  gradients — which, by this branch's own certificates-don't-transfer finding, can
+  disagree; the exact per-lane certificate for gradients is the NaN poison itself.
+  The drift: a docstring written at M3 time claimed the characterization grid's
+  stalls were "eliminated" before the grid was measured (it halves eager, washes out
+  under vmap); a kappa trend stated context-free that only exists in the eager
+  context; effect sizes quoted without their small event counts; an adjoint-gate
+  table still quoting the retired pinned protocol's numbers. Eight further findings
+  were refuted by the panel.

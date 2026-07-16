@@ -176,9 +176,10 @@ the colouring regression (FINDINGS.md) — the suite earned its keep on its own 
 The branch adds a `lax.while_loop` sibling of the host-side static solve so a batch of
 independent solves can run under `jax.vmap` — the host driver's Python `while` cannot be
 batched, which had pinned a Fisher-information design loop at batch 4. Same kernels,
-same acceptance rules; only the driver moved, and the host path is untouched
-byte-for-byte (the two CG kernels gained optional default-None preconditioner
-arguments; the host driver's calls and behaviour are bit-identical). Gate scene
+same acceptance rules; only the driver moved. The host drivers and their call sites
+are unchanged and their behaviour is bit-identical; the two shared CG kernels gained
+optional default-None preconditioner arguments, which is the whole of the host-path
+diff. Gate scene
 throughout: the M4 seated fixture (3x3x3 slab, clamped base, sphere indenter, barrier
 active).
 
@@ -201,7 +202,7 @@ on positions, float64):
 | agreement, eager, contact sweep (gap in barrier band asserted per survivor) | 15/27 survive at tol 1e-11; worst rel diff 5.4e-13 class (per-point spot checks 9.6e-14) |
 | agreement, contact-free (mu sweep, tol 1e-10 — its floor is ~1e-11) | rel diff 7.1e-14 class |
 | batching: vmap lanes vs sequential host solves | survivors match elementwise, same tolerance class |
-| adjoint under vmap vs central differences (tol per gate's noise budget) | mu 3.9e-6..7.9e-6; radius 3.3e-5/5.0e-6; rest-directional 3.9e-6/4.3e-6 (gate 1e-4) |
+| adjoint under vmap vs central differences (tol per gate's noise budget) | mu: 4/7 survive, 7.4e-6..1.2e-5; radius: 4/5 survive, 5.0e-6..3.3e-5; rest-directional: 3/7 survive, 2.7e-6..4.3e-6 (gate 1e-4) |
 | refusal, constructed asymmetry (tol 1e-6 descent-phase lane + penetrating zigzag lane) | converged=[T,F]; unconverged lane all-NaN gradient; healthy lane equal to solo within 4e-5 (adjoint-CG 1e-5 tolerance class) |
 | transcription vs line-for-line host replica (forced rejections, damping ladder 0→1e-4→1e-3, timid accept found at runtime, NaN direction) | bitwise equal, every pass |
 
@@ -213,7 +214,7 @@ are sized so probe stop-noise sits well under the difference signal (mu: h=1e-3 
 1e-10, its signal is ~2e-4/unit; rest positions: tol 1e-9 suffices, its signal is
 orders larger — and 1e-10 starved the sweep to one survivor on the Linux box).
 
-### The stall pockets: propensity is systematic, the trigger is a lottery, masking is biased
+### The stall pockets: propensity trends with depth, the trigger is a lottery, masking is unsafe
 
 135-point grid (mu in 30..70, indentation 0.01..0.03 with a per-depth feasible start,
 kappa in 500..2000), tol=1e-9, max_iterations=100, five compilation contexts
@@ -230,13 +231,20 @@ kappa in 500..2000), tol=1e-9, max_iterations=100, five compilation contexts
 Stall-location overlap between contexts: Jaccard 0.00–0.20 (even eager-vs-vmap of the
 same driver: 0.14; host vs traced vmap: 0.00).
 
-Reading: stall *probability* rises with problem stiffness — ~4x with indentation in
-both plain traced contexts, with kappa in the eager one — while stall *location* is
-nearly uncorrelated across compilations of the same math. That is a systematic
-propensity with a last-ulp trigger, and it settles the masking question: **masking
-unconverged lanes is biased.** The dropped samples over-represent deep-indentation,
-stiff-barrier problems, so a masked Monte-Carlo estimate of E[logdet I] under-weights
-exactly the loads that carry the most information, with no symptom. Per-lane rates of
+Reading: stall *probability* rises with indentation in every unpreconditioned
+context (3.75x eager, 2.75x vmap, 1.75x host, shallow to deep) and with kappa in the
+eager context only (4% -> 16%; the kappa marginal is flat-to-falling elsewhere) —
+while stall *location* is nearly uncorrelated across compilations of the same math.
+Statistical honesty about the effect sizes: each marginal rests on small event counts
+(n=27 per indentation level, n=45 per kappa level, 0–7 stalls per cell), so no single
+marginal is individually significant — the finding is the *direction's consistency*
+across three independently compiled contexts, not any one ratio. For the caller the
+asymmetry settles the masking question anyway: **masking unconverged lanes is
+unsafe.** Masking is unbiased only if stall propensity is independent of the
+parameters, and the data points the other way in every unpreconditioned context along
+the indentation axis — the dropped samples over-represent deep-indentation problems,
+so a masked Monte-Carlo estimate of E[logdet I] under-weights the most informative
+loads, with no symptom. Per-lane rates of
 5–10% put P(at least one stalled lane) at ~99.9% for B=128 — every gradient step of the
 intended caller sees the refusal unless it mitigates (see the caller contract in
 `static.py`).
@@ -258,12 +266,14 @@ both-converged point) and a preconditioned adjoint-vs-FD sweep (rel errors in th
 Measured: on the fixed-scene pocket prototype (indentation 0.02, kappa 1e3) it is a
 clean kill at tol=1e-9 — 5/16 known pocket points stalled plain, 0/16 preconditioned,
 all 10–14 iterations. On the full characterization grid it halves the eager stall rate
-(10.4% → 5.9%) but is neutral-to-noise under vmap (7.4% → 9.6%); at tol=1e-11 pockets
-shuffle rather than vanish (9/16 → 3/16 at different points). The honest summary: the
-preconditioner fixes the conditioning-driven ~1e-9 plateaus in the regime the
-benchmark's caller draws from, is cheap, and is worth switching on for batched work —
-and it does **not** release the caller from reading `converged`, because the deep-
-indentation stalls and the vmap lottery survive it. If those must die too, the
+(10.4% → 5.9%) but is neutral-to-noise under vmap (7.4% → 9.6%), and its surviving
+stalls concentrate at the mid-depth indentations (peak 19% eager / 22% vmap at 0.025,
+with clean endpoints at 0.01 and 0.03); at tol=1e-11 pockets shuffle rather than
+vanish (9/16 → 3/16 at different points). The honest summary: the preconditioner fixes
+the conditioning-driven ~1e-9 plateaus in the prototype's regime and the B<=16
+benchmark draws, is cheap, and is worth switching on for batched work — and it does
+**not** release the caller from reading `converged`, because mid-depth stalls and the
+vmap lottery survive it. If those must die too, the
 structural fix remains M6 (offset geometry, the large-contact-radius escape from
 barrier stiffness): with M3 only halving the tax, M6 is no longer a stretch goal but
 the critical path for any caller that cannot tolerate certificate-reading.
@@ -283,7 +293,8 @@ absolute times, and treat even ratios as one-significant-figure:
 | 64 | 0.030 / 0.035 | 0.79x / 0.55x | 0.64x | 53/64 |
 
 Reading: plain traced batching pays only at B=1 (the compiled loop vs ~40 host syncs
-per solve on a 54-DOF mesh); at B>=4 the random draw's stalled lanes (5–14% of lanes)
+per solve on a 54-DOF mesh); at B>=4 the random draw's stalled lanes (5–25% of lanes
+across the recorded runs)
 run to max_iterations=100 and a batched while_loop pays max-over-lanes, so one stalled
 lane drags every healthy one through ~90 masked passes. With block-Jacobi the B=4 and
 B=16 draws converge on every lane and batching pays 7–21x; at B=64 that compilation
@@ -293,3 +304,43 @@ healthy lane pays for the worst one. GPU scaling is untested — linbox01's RTX 
 at 100% utilisation on both attempts; the CPU numbers establish the mechanism (masking
 works; drag is max-over-lanes; stall-free batches win) and a GPU would change
 constants, not structure.
+
+### Final verification
+
+Local (macOS dev machine, CPU, JAX 0.10.2): full suite **214 passed, 337 subtests, 0
+failed**, 56m36s, on the tree at the M4 commit; the subsequent review-round-2 delta is
+documentation plus gate-file additions, and the gate file was re-verified green on the
+final tree (18 passed, 66 subtests, including two new preconditioner-wiring tests).
+
+Portability (linbox01: x86_64 Linux, JAX 0.9.2, CPU): **every gate this branch wrote
+passes on a machine that did not author it** — the swept design's first contact went
+15/16 with the one failure being a survivor floor at an over-tight tolerance, fixed by
+that gate's own noise budget, then fully green. The full suite there is **211 passed /
+3 failed**: all three failures are the *parent branch's* pinned
+`StaticAdjointTests` FD gates (mu, lam, body_force), and running the parent commit's
+own tree on the same box reproduces them with bit-identical assertion values — the
+parent's M4 gates carry the same machine-pinned-fixture disease this branch's rewrite
+fixed for its own gates, with silently-stalled FD probes biasing the difference
+quotient by ~4e-3. The fix pattern (sweep, filter on certificates, survivor floor,
+probe-convergence asserts) is demonstrated in `test_static_traced.py` and left to the
+parent branch's owner rather than smuggled into this one.
+
+A second adversarial review (5 lenses, 3 refuters per finding) ran over the M2/M3/M4
+additions and confirmed a batch of documentation-accuracy defects — a stale docstring
+claiming grid-level stall elimination the tables refute, a kappa trend generalized
+beyond its one measured context, missing small-sample caveats, an adjoint-gate table
+quoting the retired protocol's numbers — plus one real test gap (nothing would have
+caught a silently no-op'd preconditioner switch) and one real contract trap
+(`solve_result` certificates come from a different compiled program than the
+gradients; the poison itself is the exact certificate). All fixed: the documents now
+carry the measured numbers with their uncertainty, and the gate file gained wiring
+tests that fail if the preconditioner stops reaching the kernels.
+
+What a reviewer would attack next, ranked: (1) the parent branch's own gates are not
+portable and this branch proved it — that is now the suite's weakest point; (2) all
+stall statistics rest on one small mesh and small event counts — direction is
+credible, effect sizes are not; (3) the GPU story is still untested (the box was
+occupied on every attempt), and the batching economics that matter to the Fisher
+caller will be decided there; (4) M6 (offset geometry) is the structural escape from
+barrier stiffness, and with M3 only halving the stall tax, it is the critical path for
+any caller that cannot tolerate certificate-reading.

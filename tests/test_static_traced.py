@@ -158,7 +158,8 @@ class SweptEquivalenceTests(unittest.TestCase):
 
     def test_agreement_eager(self):
         survivors = 0
-        for params, (problem, host) in zip(_sweep_params(), self.host_results):
+        grid = [(mu, dz) for mu in _SWEEP_MUS for dz in _SWEEP_DZS]
+        for (mu, dz), (problem, host) in zip(grid, self.host_results):
             traced = solve_static_equilibrium_traced(
                 problem,
                 tol=_SWEEP_TOL,
@@ -167,7 +168,7 @@ class SweptEquivalenceTests(unittest.TestCase):
             )
             if not (bool(host.converged) and bool(traced.converged)):
                 continue
-            with self.subTest(mu=float(np.asarray(params.mu))):
+            with self.subTest(mu=mu, dz=dz):
                 self._assert_survivor(problem, traced.position, host)
             survivors += 1
         self.assertGreaterEqual(
@@ -366,11 +367,12 @@ class SweptAdjointUnderVmapTests(unittest.TestCase):
 
     def test_material_mu(self):
         # h = 1e-3, not the host gates' 1e-4: the FD probes stop anywhere below
-        # _ADJOINT_TOL, feeding ~1e-11 of stop noise into the loss difference, and at
-        # the sweep's weak end (dL/dmu ~ 2e-4 at mu=40) a 2h = 2e-4 step leaves that
-        # noise a quarter of the 1e-4 gate. Ten times the step is still only 2.5e-5
-        # of mu -- truncation stays negligible -- and puts the noise two decades under
-        # the gate across the whole sweep, not just at the strongest sample.
+        # _ADJOINT_TOL, feeding ~1e-11 of stop noise into the loss difference. At the
+        # sweep's weak end (dL/dmu ~ 2e-4) an h = 1e-4 numerator is ~4e-8, putting
+        # that noise at ~2.5e-4 relative -- OVER the 1e-4 gate (measured 8.9e-4 once,
+        # at tol=1e-9); ten times the step is still only 2.5e-5 of mu (truncation
+        # negligible) and puts the noise at ~2.5e-5, four times under the gate at the
+        # weakest sample and further everywhere else.
         self._check_swept(
             lambda v: StaticParams(mu=v),
             [35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0],
@@ -389,6 +391,122 @@ class SweptAdjointUnderVmapTests(unittest.TestCase):
             1e-3,
             min_survivors=3,
             preconditioner="block_jacobi",
+        )
+
+    def test_preconditioner_reaches_the_kernels(self):
+        """The equivalence and adjoint gates above assert properties the *plain* path
+        already satisfies, so a regression that silently no-ops the block-Jacobi
+        switch (a string typo in the wrapper, a dropped kwarg) would pass every one of
+        them. This is the wiring check: drive the step function and the adjoint
+        backward eagerly with the option on, and record whether the block builder and
+        the adjoint CG actually receive the blocks."""
+        problem = apply_static_params(self.template, StaticParams(mu=jnp.asarray(50.0)))
+        from diff_vbd.setup.boundary_conditions import evaluate_dirichlet_targets
+
+        prescribed, _ = evaluate_dirichlet_targets(
+            problem.boundary_conditions, 0.0, float(problem.solver.dt)
+        )
+        dirichlet = np.flatnonzero(
+            np.asarray(problem.boundary_conditions.dirichlet_mask, dtype=bool)
+        )
+        free = jnp.asarray(static_module._free_indices(problem), dtype=jnp.int32)
+        pinned = (
+            jnp.asarray(self.initial).at[dirichlet].set(jnp.asarray(prescribed)[dirichlet])
+        )
+        u0 = pinned[free]
+        gradient0 = static_module._gradient(problem, pinned, free, u0)
+        carry = (
+            u0, gradient0, jnp.linalg.norm(gradient0),
+            jnp.zeros((), dtype=u0.dtype), jnp.zeros((), dtype=jnp.int32),
+            jnp.zeros((), dtype=jnp.int32), jnp.zeros((), dtype=bool),
+        )
+
+        calls = {"blocks": 0}
+        original_blocks = static_module._free_vertex_blocks
+
+        def recording_blocks(*args):
+            calls["blocks"] += 1
+            return original_blocks(*args)
+
+        static_module._free_vertex_blocks = recording_blocks
+        try:
+            static_module._traced_newton_step(
+                problem, pinned, free, jnp.linalg.norm(gradient0), 250, carry,
+                use_block_jacobi=False,
+            )
+            self.assertEqual(calls["blocks"], 0)
+            static_module._traced_newton_step(
+                problem, pinned, free, jnp.linalg.norm(gradient0), 250, carry,
+                use_block_jacobi=True,
+            )
+            self.assertEqual(calls["blocks"], 1)
+        finally:
+            static_module._free_vertex_blocks = original_blocks
+
+        # The backward half: the preconditioned adjoint must hand non-None blocks to
+        # _adjoint_cg. jax.grad re-traces custom_vjp backwards on every call, so the
+        # patched module global is visible.
+        received = {"preconditioner": []}
+        original_cg = static_module._adjoint_cg
+
+        def recording_cg(problem_, pinned_, free_, u_star, w, maxiter, preconditioner=None):
+            received["preconditioner"].append(preconditioner is not None)
+            return original_cg(
+                problem_, pinned_, free_, u_star, w,
+                maxiter=maxiter, preconditioner=preconditioner,
+            )
+
+        static_module._adjoint_cg = recording_cg
+        try:
+            jax.grad(
+                lambda v: jnp.sum(
+                    self.weights * self.preconditioned_adjoint(StaticParams(mu=v))
+                )
+            )(jnp.asarray(50.0))
+            jax.grad(
+                lambda v: jnp.sum(self.weights * self.adjoint(StaticParams(mu=v)))
+            )(jnp.asarray(50.0))
+        finally:
+            static_module._adjoint_cg = original_cg
+        self.assertEqual(received["preconditioner"], [True, False])
+
+    def test_preconditioner_changes_the_cg_iterates(self):
+        """The behavioural half of the wiring check: with a deliberately anisotropic
+        block preconditioner and a truncated CG budget, the returned direction must
+        differ from the unpreconditioned one -- if it does not, M is not reaching the
+        solver no matter what the plumbing says. (At full CG convergence both reach
+        the same Newton direction; truncation is what makes the difference visible.)"""
+        problem = apply_static_params(self.template, StaticParams(mu=jnp.asarray(50.0)))
+        from diff_vbd.setup.boundary_conditions import evaluate_dirichlet_targets
+
+        prescribed, _ = evaluate_dirichlet_targets(
+            problem.boundary_conditions, 0.0, float(problem.solver.dt)
+        )
+        dirichlet = np.flatnonzero(
+            np.asarray(problem.boundary_conditions.dirichlet_mask, dtype=bool)
+        )
+        free = jnp.asarray(static_module._free_indices(problem), dtype=jnp.int32)
+        pinned = (
+            jnp.asarray(self.initial).at[dirichlet].set(jnp.asarray(prescribed)[dirichlet])
+        )
+        u = pinned[free]
+        gradient = static_module._gradient(problem, pinned, free, u)
+        anisotropic = jnp.tile(
+            jnp.diag(jnp.asarray([1.0, 10.0, 100.0])), (free.shape[0], 1, 1)
+        )
+        plain = static_module._newton_direction(
+            problem, pinned, free, u, gradient,
+            jnp.asarray(0.5), jnp.asarray(0.0), maxiter=3,
+        )
+        preconditioned = static_module._newton_direction(
+            problem, pinned, free, u, gradient,
+            jnp.asarray(0.5), jnp.asarray(0.0), maxiter=3,
+            preconditioner=anisotropic,
+        )
+        self.assertFalse(
+            bool(jnp.allclose(plain, preconditioned, rtol=1e-8)),
+            msg="M did not change truncated-CG iterates: the preconditioner is not "
+            "reaching the solve",
         )
 
     def test_collider_radius(self):
