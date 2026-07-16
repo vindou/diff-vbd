@@ -271,6 +271,7 @@ def main() -> int:
         contact_kappa=config.contact.kappa,
         contact_friction_mu=config.contact.friction_mu,
         contact_eps_v=config.contact.eps_v,
+        contact_activation=config.contact.activation,
         contact_use_barrier=config.contact.use_barrier,
         contact_enabled=config.contact.enabled,
         self_collision=config.contact.self_collision,

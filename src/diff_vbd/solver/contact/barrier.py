@@ -1,13 +1,33 @@
-"""IPC log barrier (Li et al. 2020) and the quadratic-penalty fallback.
+"""Contact activation energies: the IPC log barrier, the quadratic penalty, and OGC's
+two-stage function.
 
-    b(g; d_hat) = -(g - d_hat)^2 * log(g / d_hat)   for 0 < g < d_hat,  else 0
+    barrier   (Li et al. 2020):   b(g) = -(g - d_hat)^2 * log(g / d_hat)   for 0 < g < d_hat
+    penalty   (VBD paper):        p(g) = (d_hat - g)^2 / 2                 for     g < d_hat
+    two-stage (Chen et al. 2025): g(d) = (d_hat - d)^2 / 2                 for tau <= d < d_hat
+                                         k' * log(tau / d) + (d_hat - tau)^2 / 2   for d < tau
 
-``b``, ``b'`` and ``b''`` all vanish at ``g == d_hat``, so the energy is C2 across the
-activation boundary and the solver never sees a kink switching a contact on or off.
+All three are *unit-stiffness*: the caller multiplies by ``kappa`` (``k_c`` in OGC's
+notation), so one stiffness parameter serves every activation. ``ACTIVATION_KINDS`` maps
+names to the int32 codes ``ContactParams.activation`` stores -- an int code rather than a
+string for the same reason collider kinds are: every field of a ``pytree_dataclass`` is a
+traced leaf.
+
+Smoothness is where the three differ, and the differences are the point:
+
+* the IPC barrier is C2 at ``d_hat`` (b, b', b'' all vanish there) but its curvature blows
+  up like ``1/g`` as the gap closes, which is what makes it stiff;
+* the penalty is C1 at ``d_hat`` and bounded everywhere -- and therefore permits penetration;
+* the two-stage function is C2 at its interior stitch ``tau = d_hat / 2`` (that choice is
+  exactly what makes ``g'' = k_c`` on both sides) but only **C1 at d_hat**: its curvature
+  steps from ``k_c`` to 0 there, as any quadratic activation's must. What it buys is a
+  *bounded* curvature over most of the active range -- ``g'' = k_c`` on the whole quadratic
+  stage -- with the log stage's infinite force reserved for the last ``tau`` of gap. The
+  C1 matching constants are derived in ``two_stage_energy``; note the paper's printed
+  coefficient (its Eq. 19) is dimensionally inconsistent and is corrected there.
 
 The argument is a **gap in length units**, not a squared distance. That choice is what lets
-an analytic collider hand the barrier a *signed* distance -- negative meaning the vertex is
-on the wrong side -- while a mesh pair hands it an unsigned distance from
+an analytic collider hand the activation a *signed* distance -- negative meaning the vertex
+is on the wrong side -- while a mesh pair hands it an unsigned distance from
 ``distances.distance_from_squared``. Both then share a single ``d_hat`` and a single
 ``kappa``. Squaring would throw away the sign, and a vertex that tunnelled through a plane
 would be pushed further out the wrong side rather than back.
@@ -15,6 +35,12 @@ would be pushed further out the wrong side rather than back.
 
 import jax
 import jax.numpy as jnp
+
+ACTIVATION_KINDS = {
+    "BARRIER": 0,
+    "PENALTY": 1,
+    "TWO_STAGE": 2,
+}
 
 # Floor on g / d_hat inside the log. A gap at or below zero means the CCD filter has
 # already failed; below the floor the barrier is continued linearly (see below).
@@ -91,6 +117,96 @@ def penalty_energy(
     excess = d_hat - gap
     energy = 0.5 * excess * excess
     return jnp.where(in_range, energy, jnp.zeros_like(energy))
+
+
+@jax.jit
+def two_stage_energy(
+    gap: jnp.ndarray,
+    d_hat: jnp.ndarray,
+    active: jnp.ndarray,
+) -> jnp.ndarray:
+    """Return OGC's two-stage activation energy (Chen et al. 2025, Eq. 18) for a gap.
+
+    A quadratic near ``d_hat`` -- cheap, bounded curvature, fast convergence -- stitched
+    C2-continuously at ``tau = d_hat / 2`` onto a pure log that carries the infinite
+    force a non-penetration guarantee needs. In OGC's notation ``r = d_hat``,
+    ``k_c = kappa`` (applied by the caller), and the stitch constants come from C1
+    matching at ``tau``:
+
+        g1'(tau) == g2'(tau):  -k_c (r - tau) == -k'_c / tau  =>  k'_c = tau k_c (r - tau)
+        g1(tau)  == g2(tau):   b = k_c/2 (r - tau)^2 + k'_c log(tau)
+
+    **The paper's printed Eq. 19 is ``k'_c = tau k_c (tau - r)^2``, and it is wrong** --
+    dimensionally (energy*length, where ``k'_c`` must carry energy, since ``g''`` must
+    carry energy/length^2) and by the paper's own C2 result: with the corrected ``k'_c``,
+    ``g2''(tau) = k'_c / tau^2 = k_c (r - tau) / tau`` equals ``g1'' = k_c`` exactly at
+    ``tau = r/2``, which is the choice the paper itself makes. The printed form does not
+    reproduce that. The log is written as ``log(tau / d)`` -- a ratio, so ``b``'s "log of
+    a length" never appears and the two forms are algebraically identical.
+
+    At ``d_hat`` the function is only **C1**: the value and slope vanish, but the
+    curvature steps from ``k_c`` to zero, as it must for any quadratic activation (the
+    IPC barrier is C2 there; the two-stage function trades that for bounded curvature
+    across the whole quadratic stage). The test pins the size of the step rather than
+    pretending it away.
+
+    Guard structure is copied from ``barrier_energy``, and both guards are load bearing
+    there and here: inactive slots are evaluated at ``d_hat`` (where energy and slope are
+    exactly zero) so no non-finite value is *produced*, and below the floor the log stage
+    is continued **linearly** so a penetrated vertex keeps a huge but finite restoring
+    gradient -- a clamp would zero it exactly where it is needed most.
+    """
+    tau = 0.5 * d_hat
+    k_prime = tau * (d_hat - tau)  # the corrected Eq. 19; == d_hat^2 / 4 at tau = d_hat/2
+
+    in_range = active & (gap < d_hat)
+    floor = _MIN_GAP_RATIO * d_hat
+
+    # Inactive slots are evaluated at d_hat, where the quadratic stage and its derivative
+    # are exactly zero -- so nothing non-finite is produced, in value or in gradient.
+    safe = jnp.where(in_range, gap, d_hat)
+
+    quadratic = 0.5 * (d_hat - safe) ** 2
+
+    # Log stage, with the argument floored by substitution (a `where`, not a `maximum`,
+    # for the same gradient-splitting reason as in `barrier_energy`).
+    g_log = jnp.where(safe < floor, floor, safe)
+    log_stage = 0.5 * (d_hat - tau) ** 2 + k_prime * jnp.log(tau / g_log)
+
+    # Linear continuation below the floor: C1 at the floor, slope -k'_c / floor, so a
+    # vertex pushed through is driven back rather than feeling a constant's zero gradient.
+    value_at_floor = 0.5 * (d_hat - tau) ** 2 + k_prime * jnp.log(tau / floor)
+    extrapolated = value_at_floor - (k_prime / floor) * (safe - floor)
+
+    energy = jnp.where(
+        safe >= tau,
+        quadratic,
+        jnp.where(safe < floor, extrapolated, log_stage),
+    )
+    return jnp.where(in_range, energy, jnp.zeros_like(energy))
+
+
+@jax.jit
+def activation_energy(
+    activation: jnp.ndarray,
+    gap: jnp.ndarray,
+    d_hat: jnp.ndarray,
+    active: jnp.ndarray,
+) -> jnp.ndarray:
+    """Dispatch on the activation kind and return the unit-stiffness contact energy.
+
+    The single switch every consumer goes through -- the pair kernel, the collider kernel
+    and the friction normal force all dispatch here, so they cannot disagree about which
+    activation the solver is running.
+    """
+    return jax.lax.switch(
+        activation,
+        (
+            lambda: barrier_energy(gap, d_hat, active),
+            lambda: penalty_energy(gap, d_hat, active),
+            lambda: two_stage_energy(gap, d_hat, active),
+        ),
+    )
 
 
 def barrier_stiffness(

@@ -162,10 +162,10 @@ class ColliderData:
 @pytree_dataclass
 class ContactParams:
     d_hat: jnp.ndarray  # activation distance, in length units
-    kappa: jnp.ndarray  # barrier stiffness
+    kappa: jnp.ndarray  # activation stiffness (k_c in OGC's notation)
     friction_mu: jnp.ndarray  # Coulomb coefficient
     eps_v: jnp.ndarray  # friction static/dynamic transition velocity
-    use_barrier: jnp.ndarray  # bool: IPC log barrier, else quadratic penalty
+    activation: jnp.ndarray  # (,) int32, see contact.barrier.ACTIVATION_KINDS
     enabled: jnp.ndarray  # bool
 
 

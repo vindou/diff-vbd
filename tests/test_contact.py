@@ -23,7 +23,13 @@ from diff_vbd.model import SimulationState
 from diff_vbd.setup.topology import build_surface_topology
 from diff_vbd.solver import vbd
 from diff_vbd.solver.contact import distances as D
-from diff_vbd.solver.contact.barrier import barrier_energy, penalty_energy
+from diff_vbd.solver.contact.barrier import (
+    ACTIVATION_KINDS,
+    activation_energy,
+    barrier_energy,
+    penalty_energy,
+    two_stage_energy,
+)
 from diff_vbd.solver.contact.ccd import (
     collider_sweep_time_of_impact,
     derive_detection_band,
@@ -275,6 +281,158 @@ class BarrierTests(unittest.TestCase):
         self.assertEqual(float(penalty_energy(self.d_hat * 2, self.d_hat, TRUE)), 0.0)
         self.assertGreater(float(penalty_energy(self.d_hat / 2, self.d_hat, TRUE)), 0.0)
         self.assertEqual(float(penalty_energy(self.d_hat / 2, self.d_hat, FALSE)), 0.0)
+
+
+class TwoStageActivationTests(unittest.TestCase):
+    """OGC's two-stage activation (Chen et al. 2025, Eq. 18), and the stitch constants.
+
+    The continuity tests are the load-bearing ones: the paper's printed C1 coefficient
+    (its Eq. 19, ``k'_c = tau k_c (tau - r)^2``) is dimensionally inconsistent, and with
+    it the *derivative* jumps by two orders of magnitude at the stitch while the energy
+    still looks plausible. A finite-difference check across ``tau`` is exactly the test
+    that catches a wrong coefficient, so the tolerances here are tight and must stay so.
+    """
+
+    def setUp(self):
+        self.d_hat = jnp.asarray(1.0e-2)
+        self.tau = 0.5e-2  # the C2 stitch: tau = d_hat / 2
+        self.g = lambda d: two_stage_energy(jnp.asarray(d), self.d_hat, TRUE)
+        self.g1 = jax.grad(lambda d: two_stage_energy(d, self.d_hat, TRUE))
+        self.g2 = jax.grad(self.g1)
+
+    def test_stage_values_match_the_closed_forms(self):
+        """Quadratic above tau, pure log below -- checked against hand-evaluated forms,
+        so a wrong stitch constant cannot hide inside a self-consistent implementation."""
+        d_hat = float(self.d_hat)
+        k_prime = self.tau * (d_hat - self.tau)  # the corrected Eq. 19
+        for gap in (7.0e-3, 5.5e-3):
+            self.assertAlmostEqual(
+                float(self.g(gap)), 0.5 * (d_hat - gap) ** 2, places=18
+            )
+        for gap in (4.0e-3, 1.0e-3):
+            expected = 0.5 * (d_hat - self.tau) ** 2 + k_prime * np.log(self.tau / gap)
+            self.assertAlmostEqual(float(self.g(gap)), expected, places=18)
+
+    def test_c2_at_the_stitch_and_c1_at_the_activation_boundary(self):
+        """g, g' and g'' continuous at tau; g and g' continuous at d_hat.
+
+        This is the finite-difference gate that catches the paper's Eq. 19 typo: with the
+        printed coefficient, g' jumps from -r^2/4 to -r/2 at the stitch -- a factor of
+        r/2 -- and the tau checks below fail by ~1e-3 rather than ~1e-10.
+        """
+        eps = 1.0e-10
+        for f, scale, label in (
+            (self.g, float(self.d_hat) ** 2, "g"),
+            (self.g1, float(self.d_hat), "g'"),
+            (self.g2, 1.0, "g''"),
+        ):
+            below = float(f(jnp.asarray(self.tau - eps)))
+            above = float(f(jnp.asarray(self.tau + eps)))
+            self.assertLess(abs(above - below), 1.0e-6 * scale, msg=f"{label} at tau")
+        for f, scale, label in (
+            (self.g, float(self.d_hat) ** 2, "g"),
+            (self.g1, float(self.d_hat), "g'"),
+        ):
+            below = float(f(jnp.asarray(float(self.d_hat) - eps)))
+            above = float(f(jnp.asarray(float(self.d_hat) + eps)))
+            self.assertLess(abs(above - below), 1.0e-6 * scale, msg=f"{label} at d_hat")
+
+    def test_curvature_steps_by_exactly_k_c_at_the_activation_boundary(self):
+        """The two-stage function is only C1 at d_hat, and the size of the kink is not an
+        accident: g'' is exactly 1 (unit stiffness) on the whole quadratic stage and 0
+        outside. Pinning the jump documents the C1-only trade rather than hiding it --
+        the IPC barrier is C2 there, and the two energies genuinely differ in this."""
+        eps = 1.0e-8
+        inside = float(self.g2(jnp.asarray(float(self.d_hat) - eps)))
+        outside = float(self.g2(jnp.asarray(float(self.d_hat) + eps)))
+        self.assertAlmostEqual(inside, 1.0, places=6)
+        self.assertEqual(outside, 0.0)
+
+    def test_derivative_matches_central_differences_in_both_stages(self):
+        h = 1.0e-9
+        for gap in (7.5e-3, 6.0e-3, 4.0e-3, 1.5e-3):
+            with self.subTest(gap=gap):
+                analytic = float(self.g1(jnp.asarray(gap)))
+                numeric = (float(self.g(gap + h)) - float(self.g(gap - h))) / (2.0 * h)
+                self.assertAlmostEqual(analytic / numeric, 1.0, places=5)
+
+    def test_penetrated_vertex_feels_a_restoring_force(self):
+        """Same gate as the barrier's: below the floor the log stage is continued
+        linearly, so the energy keeps climbing and the derivative stays negative --
+        never a clamp whose gradient is zero exactly where the push-back matters."""
+        first = jax.grad(lambda gap: two_stage_energy(gap, self.d_hat, TRUE))
+        previous_energy = -np.inf
+        for gap in (1.0e-3, 1.0e-6, 0.0, -1.0e-6, -1.0e-3, -1.0):
+            with self.subTest(gap=gap):
+                energy = float(self.g(gap))
+                derivative = float(first(jnp.asarray(gap)))
+                self.assertTrue(np.isfinite(energy))
+                self.assertTrue(np.isfinite(derivative))
+                self.assertGreater(energy, previous_energy)
+                self.assertLess(derivative, 0.0)
+                previous_energy = energy
+
+    def test_inactive_primitive_has_zero_energy_and_zero_gradient(self):
+        """The `0 * inf == nan` trap, for the new activation."""
+        first = jax.grad(lambda gap: two_stage_energy(gap, self.d_hat, FALSE))
+        for gap in (1.0e-3, 0.0, -1.0e-9, -1.0e3):
+            with self.subTest(gap=gap):
+                energy = float(two_stage_energy(jnp.asarray(gap), self.d_hat, FALSE))
+                self.assertEqual(energy, 0.0)
+                derivative = float(first(jnp.asarray(gap)))
+                self.assertFalse(np.isnan(derivative))
+                self.assertEqual(derivative, 0.0)
+
+    def test_dispatcher_selects_each_activation(self):
+        gap = jnp.asarray(4.0e-3)
+        kernels = {
+            "BARRIER": barrier_energy,
+            "PENALTY": penalty_energy,
+            "TWO_STAGE": two_stage_energy,
+        }
+        for name, code in ACTIVATION_KINDS.items():
+            with self.subTest(activation=name):
+                dispatched = float(
+                    activation_energy(
+                        jnp.asarray(code, dtype=jnp.int32), gap, self.d_hat, TRUE
+                    )
+                )
+                self.assertEqual(dispatched, float(kernels[name](gap, self.d_hat, TRUE)))
+
+    def test_friction_normal_force_follows_the_selected_activation(self):
+        """Friction must be driven by the force the solver actually applies. The three
+        activations exert genuinely different forces at the same gap, so if the normal
+        force ever read the barrier while the solve ran the two-stage energy, this is
+        the line that goes red."""
+        from diff_vbd.solver.contact.friction import contact_normal_force
+
+        problem = _block_on_plane(contact_activation="two_stage")
+        params = problem.contact.params
+        gap = jnp.asarray(0.4e-3)
+        force = float(contact_normal_force(params, gap, TRUE))
+        expected = float(params.kappa) * abs(
+            float(jax.grad(lambda d: two_stage_energy(d, params.d_hat, TRUE))(gap))
+        )
+        self.assertAlmostEqual(force, expected, delta=1.0e-12 * expected)
+        barrier_force = float(params.kappa) * abs(
+            float(jax.grad(lambda d: barrier_energy(d, params.d_hat, TRUE))(gap))
+        )
+        self.assertNotAlmostEqual(force, barrier_force, delta=1.0e-3 * barrier_force)
+
+    def test_block_settles_on_the_plane_without_penetrating(self):
+        """The RestingContactTests scene, re-run under the two-stage activation: the
+        end-to-end gate that the new energy actually holds a body up. The log stage's
+        infinite force is what keeps the resting gap strictly positive; the quadratic
+        stage alone (the penalty) would not."""
+        problem = _block_on_plane(contact_activation="two_stage")
+        state = _initial(problem)
+        _, history = simulate(problem, state, num_steps=250, show_progress=False)
+
+        heights = np.asarray(history.position)[:, :, 2]
+        self.assertTrue(np.all(np.isfinite(heights)))
+        self.assertGreater(float(heights.min()), 0.0)  # never penetrates, at any step
+        final_gap = float(np.asarray(history.position)[-1][:, 2].min())
+        self.assertLess(final_gap, float(problem.contact.params.d_hat))
 
 
 class DistanceTests(unittest.TestCase):
@@ -905,6 +1063,46 @@ class ContactAssemblyTests(unittest.TestCase):
             assemble_problem(
                 positions, tets, free, colliders=[{"kind": "banana"}]
             )
+
+    def test_activation_names_resolve_to_their_codes(self):
+        for name, code in ACTIVATION_KINDS.items():
+            with self.subTest(activation=name):
+                problem = _block_on_plane(contact_activation=name.lower())
+                self.assertEqual(int(problem.contact.params.activation), code)
+
+    def test_activation_defaults_to_the_barrier(self):
+        problem = _block_on_plane()
+        self.assertEqual(
+            int(problem.contact.params.activation), ACTIVATION_KINDS["BARRIER"]
+        )
+
+    def test_legacy_use_barrier_bool_still_selects_the_energy(self):
+        """`use_barrier` predates the activation enum; existing configs must not change
+        behaviour underneath their owners."""
+        self.assertEqual(
+            int(
+                _block_on_plane(contact_use_barrier=True).contact.params.activation
+            ),
+            ACTIVATION_KINDS["BARRIER"],
+        )
+        self.assertEqual(
+            int(
+                _block_on_plane(contact_use_barrier=False).contact.params.activation
+            ),
+            ACTIVATION_KINDS["PENALTY"],
+        )
+
+    def test_specifying_both_activation_spellings_is_rejected(self):
+        """Two ways to say the contact model must not resolve by precedence: a config
+        that says two different things should be an error, not a coin flip."""
+        with self.assertRaisesRegex(ValueError, "not both"):
+            _block_on_plane(
+                contact_activation="two_stage", contact_use_barrier=True
+            )
+
+    def test_unknown_activation_name_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown contact activation"):
+            _block_on_plane(contact_activation="banana")
 
     def test_rebuilding_contact_does_not_trigger_recompilation(self):
         """Host-side detection rebuilds the contact buffers every step. That is only viable

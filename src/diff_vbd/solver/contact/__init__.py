@@ -13,9 +13,12 @@ Keeping the line clean is what makes the whole thing jit-able (static shapes), g
 """
 
 from diff_vbd.solver.contact.barrier import (
+    ACTIVATION_KINDS,
+    activation_energy,
     barrier_energy,
     barrier_stiffness,
     penalty_energy,
+    two_stage_energy,
 )
 from diff_vbd.solver.contact.ccd import (
     derive_detection_band,
@@ -68,10 +71,12 @@ from diff_vbd.solver.contact.potential import (
 )
 
 __all__ = [
+    "ACTIVATION_KINDS",
     "COLLIDER_KINDS",
     "EDGE_EDGE_TYPES",
     "PAIR_TYPES",
     "POINT_TRIANGLE_TYPES",
+    "activation_energy",
     "barrier_energy",
     "barrier_stiffness",
     "build_contact_incidence",
@@ -107,5 +112,6 @@ __all__ = [
     "smooth_friction_f1",
     "sweep_time_of_impact",
     "tangent_basis",
+    "two_stage_energy",
     "vertex_time_of_impact",
 ]

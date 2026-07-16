@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 
 from diff_vbd.model import ColliderData, ContactParams, ContactState
-from diff_vbd.solver.contact.barrier import barrier_energy, penalty_energy
+from diff_vbd.solver.contact.barrier import activation_energy
 from diff_vbd.solver.contact.colliders import collider_signed_distance
 from diff_vbd.solver.contact.friction import (
     collider_friction_energy,
@@ -54,11 +54,7 @@ def pair_contact_energy(
         pair_positions, rest_pair_positions, pair_type
     )
 
-    energy = jax.lax.cond(
-        params.use_barrier,
-        lambda: barrier_energy(gap, params.d_hat, valid),
-        lambda: penalty_energy(gap, params.d_hat, valid),
-    )
+    energy = activation_energy(params.activation, gap, params.d_hat, valid)
     return params.kappa * mollifier * energy
 
 
@@ -81,11 +77,7 @@ def collider_contact_energy(
             position, kind, normal, offset, center, radius, outside
         )
         active = enabled & params.enabled
-        return jax.lax.cond(
-            params.use_barrier,
-            lambda: barrier_energy(gap, params.d_hat, active),
-            lambda: penalty_energy(gap, params.d_hat, active),
-        )
+        return activation_energy(params.activation, gap, params.d_hat, active)
 
     energies = jax.vmap(one_collider)(
         colliders.kind,

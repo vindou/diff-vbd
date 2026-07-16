@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 
 from diff_vbd.model import ColliderData, ContactParams
-from diff_vbd.solver.contact.barrier import barrier_energy, penalty_energy
+from diff_vbd.solver.contact.barrier import activation_energy
 from diff_vbd.solver.contact.colliders import collider_normal, collider_signed_distance
 from diff_vbd.solver.contact.distances import pair_gap_and_mollifier
 
@@ -35,17 +35,16 @@ def contact_normal_force(
     """Return the magnitude of the normal force the contact potential applies at ``gap``.
 
     Coulomb friction is bounded by ``mu`` times the normal force, so it has to be the force
-    the solver *actually applies* -- which means dispatching on ``use_barrier`` exactly as
-    the energy does. Reading it off the barrier while the solve is running the quadratic
-    penalty would drive friction from a force that is not there.
+    the solver *actually applies* -- which means dispatching on ``params.activation``
+    exactly as the energy does, through the same ``activation_energy`` switch. Reading it
+    off the barrier while the solve is running a different activation would drive friction
+    from a force that is not there.
 
-    Both energies return an exactly-zero gradient when ``active`` is false, so an inactive or
-    padded slot yields a zero force with no NaN.
+    Every activation returns an exactly-zero gradient when ``active`` is false, so an
+    inactive or padded slot yields a zero force with no NaN.
     """
-    force = jax.lax.cond(
-        params.use_barrier,
-        lambda: jax.grad(barrier_energy)(gap, params.d_hat, active),
-        lambda: jax.grad(penalty_energy)(gap, params.d_hat, active),
+    force = jax.grad(activation_energy, argnums=1)(
+        params.activation, gap, params.d_hat, active
     )
     return params.kappa * jnp.abs(force)
 

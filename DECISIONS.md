@@ -16,3 +16,15 @@ Format: date · decision · rationale. Append-only.
   equality, so it goes first. M1 is still the first milestone that touches *physics*, and it
   lands before any contact-model change (M2/M3), which is what "M1 first" is for.
 
+- **2026-07-16 · M2 keeps `use_barrier` working as a legacy spelling.** The enum
+  (`contact_activation: barrier | penalty | two_stage`) replaces the bool everywhere
+  internally; the bool maps onto it at the `assemble_problem` boundary, and specifying
+  both is an error rather than a precedence rule. Existing configs must not change
+  behaviour underneath their owners.
+
+- **2026-07-16 · M2's continuity gate asserts what is mathematically true, not what the
+  brief's shorthand says.** The two-stage activation is C2 at the stitch `tau` and only
+  C1 at `d_hat`: `g''` steps from `k_c` to 0 there, as it must for any quadratic
+  activation (the paper's own C2 claim is about `tau`). The test pins the size of that
+  step to exactly `k_c` instead of pretending it is zero — hiding it would be tuning a
+  gate to pass.

@@ -29,7 +29,7 @@ from diff_vbd.setup.topology import (
     build_surface_topology,
     build_vertex_coloring,
 )
-from diff_vbd.solver.contact.barrier import barrier_stiffness
+from diff_vbd.solver.contact.barrier import ACTIVATION_KINDS, barrier_stiffness
 from diff_vbd.solver.contact.colliders import COLLIDER_KINDS
 
 
@@ -269,6 +269,33 @@ def empty_contact_state(num_vertices: int, capacity: int, max_per_vertex: int):
     )
 
 
+def _resolve_contact_activation(
+    activation: str | None, use_barrier: bool | None
+) -> int:
+    """Resolve the activation name (and the legacy ``use_barrier`` bool) to an int code.
+
+    ``use_barrier`` predates the activation enum and is kept working so existing configs
+    and call sites do not silently change behaviour; specifying both is an error rather
+    than a precedence rule, because a config that says two different things about the
+    contact model should not quietly mean one of them.
+    """
+    if use_barrier is not None:
+        if activation is not None:
+            raise ValueError(
+                "specify contact_activation or the legacy contact_use_barrier, not both"
+            )
+        activation = "barrier" if use_barrier else "penalty"
+    if activation is None:
+        activation = "barrier"
+    key = str(activation).upper()
+    if key not in ACTIVATION_KINDS:
+        raise ValueError(
+            f"unknown contact activation {activation!r}; expected one of "
+            f"{sorted(name.lower() for name in ACTIVATION_KINDS)}"
+        )
+    return ACTIVATION_KINDS[key]
+
+
 def _build_contact_data(
     colliders: Sequence[Mapping[str, object]] | None,
     *,
@@ -276,7 +303,7 @@ def _build_contact_data(
     kappa: float,
     friction_mu: float,
     eps_v: float,
-    use_barrier: bool,
+    activation: int,
     contact_enabled: bool,
     dtype,
     tets=None,
@@ -345,7 +372,7 @@ def _build_contact_data(
         kappa=jnp.asarray(kappa, dtype=dtype),
         friction_mu=jnp.asarray(friction_mu, dtype=dtype),
         eps_v=jnp.asarray(eps_v, dtype=dtype),
-        use_barrier=jnp.asarray(use_barrier, dtype=jnp.bool_),
+        activation=jnp.asarray(activation, dtype=jnp.int32),
         enabled=jnp.asarray(
             contact_enabled and (bool(specs) or self_collision), dtype=jnp.bool_
         ),
@@ -445,7 +472,8 @@ def assemble_problem(
     contact_kappa: float | None = None,
     contact_friction_mu: float = 0.0,
     contact_eps_v: float = 1.0e-3,
-    contact_use_barrier: bool = True,
+    contact_activation: str | None = None,
+    contact_use_barrier: bool | None = None,
     contact_enabled: bool = True,
     self_collision: bool = False,
     self_collision_ccd: bool = True,
@@ -558,7 +586,9 @@ def assemble_problem(
         kappa=contact_kappa,
         friction_mu=contact_friction_mu,
         eps_v=contact_eps_v,
-        use_barrier=contact_use_barrier,
+        activation=_resolve_contact_activation(
+            contact_activation, contact_use_barrier
+        ),
         contact_enabled=contact_enabled,
         dtype=dtype,
         tets=tets,

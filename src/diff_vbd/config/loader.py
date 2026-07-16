@@ -80,7 +80,11 @@ class ContactConfig:
     kappa: float | None
     friction_mu: float
     eps_v: float
-    use_barrier: bool
+    # `activation` names the contact energy ("barrier", "penalty", "two_stage");
+    # `use_barrier` is the legacy bool spelling. Both are carried raw and resolved in
+    # `assemble_problem`, so "both specified" is diagnosed in exactly one place.
+    activation: str | None
+    use_barrier: bool | None
     self_collision: bool
     self_collision_ccd: bool
     ccd_slack: float
@@ -321,7 +325,8 @@ def _parse_contact_config(data: Any) -> ContactConfig:
             kappa=None,
             friction_mu=0.0,
             eps_v=1.0e-3,
-            use_barrier=True,
+            activation=None,
+            use_barrier=None,
             self_collision=False,
             self_collision_ccd=True,
             ccd_slack=0.9,
@@ -345,7 +350,16 @@ def _parse_contact_config(data: Any) -> ContactConfig:
             section.get("friction_mu", 0.0), "contact.friction_mu"
         ),
         eps_v=_require_float(section.get("eps_v", 1.0e-3), "contact.eps_v"),
-        use_barrier=bool(section.get("use_barrier", True)),
+        activation=(
+            None
+            if section.get("activation") is None
+            else _require_string(section.get("activation"), "contact.activation")
+        ),
+        use_barrier=(
+            None
+            if section.get("use_barrier") is None
+            else bool(section.get("use_barrier"))
+        ),
         self_collision=bool(section.get("self_collision", False)),
         self_collision_ccd=bool(section.get("self_collision_ccd", True)),
         ccd_slack=_require_float(
@@ -543,6 +557,7 @@ def load_problem_from_yaml(
         contact_kappa=config.contact.kappa,
         contact_friction_mu=config.contact.friction_mu,
         contact_eps_v=config.contact.eps_v,
+        contact_activation=config.contact.activation,
         contact_use_barrier=config.contact.use_barrier,
         contact_enabled=config.contact.enabled,
         self_collision=config.contact.self_collision,
