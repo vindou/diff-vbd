@@ -28,3 +28,27 @@ Format: date · decision · rationale. Append-only.
   activation (the paper's own C2 claim is about `tau`). The test pins the size of that
   step to exactly `k_c` instead of pretending it is zero — hiding it would be tuning a
   gate to pass.
+
+- **2026-07-16 · M4 static solve refuses friction, rigid regions and self-collision.**
+  Friction: the lagged Coulomb force is not the gradient of any potential, so a state
+  held by friction is not a stationary point of Pi and the adjoint identity is false
+  there. Rigid regions: the projection is a constraint outside the energy. Self-collision:
+  the pair set is complete only within a detection band sized for one dynamic step, and a
+  static Newton step respects no band. Each raises with the reason and the remedy, in
+  `_audit_step`'s register. Analytic colliders have no pair set and are exact.
+
+- **2026-07-16 · M4 requires a feasible initial state, like every interior-point method.**
+  The barrier is infinite at zero gap; a start that already penetrates has no finite-energy
+  path back through it (the linear continuation exists to recover from *rounding*, not
+  from initialisation). The gate test builds a feasible initial guess explicitly (column
+  compression under the indenter) rather than teaching the solver to un-penetrate, which
+  would be a lie about what barrier methods can do.
+
+- **2026-07-16 · M4's collider safeguard clips per vertex, not by a global factor.** The
+  first implementation capped the whole Newton direction by the minimum per-vertex
+  collider time of impact; one vertex creeping toward the indenter then limited the whole
+  mesh to ~1% of its step per iteration and the solve crawled — the sweep filter's
+  global-throttling failure mode, reproduced in statics. Per-vertex clipping is sound
+  against *static* colliders (no other party moves), and with it plus adaptive Levenberg
+  damping (the log barrier's quadratic model overshoots wildly near contact) the gate
+  scene converges in 9 Newton iterations to a 4e-12 residual.
