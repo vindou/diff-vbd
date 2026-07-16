@@ -39,6 +39,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from diff_vbd.model import ColliderData
+from diff_vbd.solver.contact.colliders import COLLIDER_KINDS, plane_signed_distance
 from diff_vbd.solver.contact.ccd import vertex_time_of_impact
 
 # OGC's relaxation parameter: the fraction of its distance budget a vertex may consume
@@ -123,6 +125,57 @@ def build_vertex_bounds(
 
 
 @jax.jit
+def _lift_off_planes(
+    colliders: ColliderData,
+    start: jnp.ndarray,
+    end: jnp.ndarray,
+    slack: jnp.ndarray,
+) -> jnp.ndarray:
+    """Clamp one vertex's endpoint against every plane, preserving tangential motion.
+
+    A scalar time of impact multiplies the *whole* motion vector, so a vertex that
+    approaches a plane loses its tangential component in the same proportion -- and a
+    resting body loses it chronically, because the inertial guess approaches by
+    ``g dt^2`` every step while the standoff gap is tiny. That acted as phantom
+    friction: measured on the incline scene, it froze a frictionless slide the old
+    global filter (whose per-iteration factor stayed at 1 in steady contact) let run at
+    exactly ``g sin(theta) cos(theta)``. A plane's free side is a **half-space, which is
+    convex**: any endpoint inside it is reachable from any interior start without
+    crossing the boundary, so clamping only the *normal* coordinate of the endpoint --
+    lift by ``((1 - slack) * gap_start - gap_end)`` along the normal when the motion
+    would consume more than ``slack`` of the gap -- is exactly sound and leaves sliding
+    untouched. Spheres get no such clamp (their outside is not convex); the scalar
+    time-of-impact backstop that runs after this handles them, and also any corner case
+    where lifting off one plane approaches another.
+
+    A penetrated start (gap <= 0) is left to the backstop's escape clause.
+    """
+
+    def one_plane(endpoint, row):
+        kind, normal, offset, enabled = row
+        gap_start = plane_signed_distance(start, normal, offset)
+        gap_end = plane_signed_distance(endpoint, normal, offset)
+        floor = (1.0 - slack) * gap_start
+        lift = jnp.maximum(floor - gap_end, 0.0)
+        applies = (
+            enabled
+            & (kind == COLLIDER_KINDS["PLANE"])
+            & (gap_start > 0.0)
+        )
+        return (
+            jnp.where(applies, endpoint + lift * normal, endpoint),
+            None,
+        )
+
+    lifted, _ = jax.lax.scan(
+        one_plane,
+        end,
+        (colliders.kind, colliders.normal, colliders.offset, colliders.enabled),
+    )
+    return lifted
+
+
+@jax.jit
 def truncate_to_bounds(
     contact,
     anchor: jnp.ndarray,
@@ -162,8 +215,18 @@ def truncate_to_bounds(
     """
     bounds = contact.state.vertex_bounds
 
+    # Planes first, component-wise (tangential motion preserved -- see
+    # _lift_off_planes); then the scalar per-vertex time of impact as the universal
+    # backstop: it is an exact no-op for endpoints the plane clamp already made safe,
+    # conservative for spheres, and covers the corner where lifting off one collider
+    # approaches another.
+    end_positions = jax.vmap(
+        lambda a, b: _lift_off_planes(contact.colliders, a, b, contact.ccd.slack)
+    )(start_positions, end_positions)
     collider_toi = jax.vmap(
-        lambda a, b: vertex_time_of_impact(contact.colliders, a, b)
+        lambda a, b: vertex_time_of_impact(
+            contact.colliders, a, b, contact.ccd.slack
+        )
     )(start_positions, end_positions)
 
     offset = start_positions - anchor

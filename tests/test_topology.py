@@ -96,6 +96,36 @@ def _reference_surface_topology(tets):
     )
 
 
+def _reference_greedy_coloring(tets, num_vertices):
+    adjacency = _reference_adjacency(tets, num_vertices)
+    colors = [-1] * num_vertices
+    for vertex in range(num_vertices):
+        used = {colors[nbr] for nbr in adjacency[vertex] if colors[nbr] >= 0}
+        color = 0
+        while color in used:
+            color += 1
+        colors[vertex] = color
+
+    num_colors = max(colors) + 1
+    color_lists = [[] for _ in range(num_colors)]
+    for vertex, color in enumerate(colors):
+        color_lists[color].append(vertex)
+
+    max_group_size = max(len(group) for group in color_lists)
+    color_groups = []
+    color_group_mask = []
+    for group in color_lists:
+        pad = max_group_size - len(group)
+        color_groups.append(group + [0] * pad)
+        color_group_mask.append([True] * len(group) + [False] * pad)
+
+    return (
+        jnp.array(color_groups, dtype=jnp.int32),
+        jnp.array(color_group_mask),
+        jnp.array(colors, dtype=jnp.int32),
+    )
+
+
 def _reference_lumped_masses(rest_positions, tets):
     masses = jnp.zeros((rest_positions.shape[0],), dtype=rest_positions.dtype)
     for tet in jax.device_get(tets):
@@ -220,8 +250,27 @@ class BuilderEquivalenceTests(unittest.TestCase):
 
 
 class ColoringValidityTests(unittest.TestCase):
-    """The one builder allowed to differ from its reference — but only into another
-    *valid* colouring, verified against the exact adjacency relation."""
+    """The colouring is pinned element-wise to the old greedy pass, not merely valid.
+
+    An earlier revision of this branch replaced greedy with Jones–Plassmann and gated
+    on validity alone — and a valid-but-different colouring changed the Gauss–Seidel
+    sweep order enough to flip a resting frictionless block from a clean slide into a
+    perpetual bounce at the same iteration budget (see FINDINGS.md). The sweep order is
+    solver behaviour, so the colouring is held bit-identical and only its computation
+    was vectorised (dependency waves over the lower-indexed-neighbour DAG)."""
+
+    def test_coloring_is_element_wise_identical_to_the_greedy_reference(self):
+        for name, (positions, tets) in _fixtures():
+            with self.subTest(fixture=name):
+                num_vertices = positions.shape[0]
+                for ref_part, new_part, label in zip(
+                    _reference_greedy_coloring(tets, num_vertices),
+                    build_vertex_coloring(tets, num_vertices),
+                    ("groups", "mask", "colors"),
+                ):
+                    np.testing.assert_array_equal(
+                        np.asarray(ref_part), np.asarray(new_part), err_msg=label
+                    )
 
     def test_no_edge_joins_two_vertices_of_one_color(self):
         for name, (positions, tets) in _fixtures():

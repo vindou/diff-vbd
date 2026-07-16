@@ -43,3 +43,17 @@ Things noticed on the way that are not milestones. Append-only.
   the gap gradient's descent directions, which closes a pair to exactly zero at 0.5 —
   plus a direct pin of the constant. (4) `test_rest_positions_directional` could pass
   vacuously if the finite-difference derivative were zero; a nonzero guard was added.
+
+- **2026-07-16 · A valid-but-different vertex colouring is a behaviour change, not an
+  implementation detail.** The full suite caught two contact tests failing after M5
+  replaced the serial greedy colouring with Jones–Plassmann (validity-gated, as the brief
+  allowed): the colour classes set VBD's Gauss–Seidel sweep order, and under JP a
+  frictionless block on a 20-degree incline stopped sliding — it bounced perpetually and
+  even crept uphill, while under the greedy colouring (and on `main`) it slides at exactly
+  g·sin·cos with zero throttle. Bisected to the M5 commit, confirmed by hot-patching the
+  colouring alone. Fix: keep the greedy colouring bit-identical, computed in vectorised
+  dependency waves over the lower-indexed-neighbour DAG (2.6x faster, and the equivalence
+  test now asserts identity rather than validity). Two dead ends are worth recording:
+  the per-vertex truncation was fully ablated with zero effect on the trajectory, and a
+  tangential-preserving plane clamp (kept — it is strictly better than scalar
+  time-of-impact clipping for planes) also changed nothing here.

@@ -86,92 +86,88 @@ def build_vertex_adjacency(tets: jnp.ndarray, num_vertices: int):
     return adjacency
 
 
-# Fixed seed for the colouring priorities. The colouring must be deterministic — it sizes
-# and orders `color_groups`, which the jitted sweep iterates — and a seed pinned here means
-# the same mesh always produces the same schedule, run to run.
-_COLORING_SEED = 0x5EED
-
-
 def build_vertex_coloring(tets: jnp.ndarray, num_vertices: int):
-    """Build a deterministic vertex coloring from tet adjacency (Jones–Plassmann).
+    """Build the same greedy vertex coloring as ever, in vectorised waves.
 
-    Jones & Plassmann [1993]: give every vertex a random priority; in each round, every
-    uncoloured vertex whose priority beats all of its uncoloured neighbours takes the
-    smallest colour its already-coloured neighbours have not used. Winners of a round are
-    an independent set by construction (priorities are a permutation, hence unique), so
-    the whole round assigns in parallel — here as numpy scatters over the edge array, with
-    no per-vertex Python work. Rounds are O(log V) in expectation.
-
-    The result is a *valid* colouring but not necessarily the one the old serial greedy
-    pass produced; nothing downstream depends on which valid colouring it gets, and the
-    test asserts validity (no edge joins two vertices of one colour) rather than equality.
+    The old implementation walked vertices in index order, colouring each with the
+    smallest colour absent among its already-coloured neighbours. That order-dependence
+    is not cosmetic: the colour classes set the Gauss-Seidel sweep order, and a
+    different (equally *valid*) colouring measurably changes how fast a sweep converges
+    -- switching to Jones-Plassmann flipped a resting frictionless block from a clean
+    slide into a perpetual bounce at the same iteration budget. So the rewrite keeps
+    the colouring **bit-identical** and only changes how it is computed: since vertex
+    ``v``'s colour depends exactly on its lower-indexed neighbours, the dependency
+    graph is a DAG whose levels can be coloured in parallel waves -- ``level[v] =
+    1 + max(level[u])`` over neighbours ``u < v``, computed by iterating a vectorised
+    ``maximum.at`` to its fixed point (one round per level), then one
+    smallest-missing-colour pass per wave over each wave's incoming edges. Interpreter
+    work is O(depth) rounds of array ops instead of O(V) per-vertex set rebuilds.
     """
     tets_np = np.asarray(jax.device_get(tets), dtype=np.int64)
     edges = _unique_tet_edges(tets_np)
-    # Both directions: every ordered (src, dst) pair appears once, so "does any neighbour
-    # outrank me" and "which colours do my neighbours hold" are each a single gather.
-    src = np.concatenate([edges[:, 0], edges[:, 1]])
-    dst = np.concatenate([edges[:, 1], edges[:, 0]])
+    low = edges.min(axis=1)
+    high = edges.max(axis=1)
 
-    priority = np.random.default_rng(_COLORING_SEED).permutation(num_vertices)
+    # Wave levels: fixed point of level[high] = max(level[high], level[low] + 1).
+    levels = np.zeros(num_vertices, dtype=np.int64)
+    while True:
+        proposed = levels[low] + 1
+        before = levels.copy()
+        np.maximum.at(levels, high, proposed)
+        if np.array_equal(levels, before):
+            break
+
     colors = np.full(num_vertices, -1, dtype=np.int64)
+    order_by_level = np.argsort(levels, kind="stable")
+    wave_starts = np.flatnonzero(
+        np.concatenate([[True], np.diff(levels[order_by_level]) > 0])
+    )
+    wave_bounds = np.concatenate([wave_starts, [num_vertices]])
 
-    # CSR adjacency, built once: neighbour lookups for a round's winners are then a
-    # segment gather costing O(sum of the winners' degrees), so the *total* colour-choice
-    # work over all rounds is O(E) rather than O(E * rounds).
-    csr_order = np.argsort(src, kind="stable")
-    csr_dst = dst[csr_order]
-    degree = np.bincount(src, minlength=num_vertices)
-    csr_starts = np.zeros(num_vertices + 1, dtype=np.int64)
-    csr_starts[1:] = np.cumsum(degree)
+    # Incoming (lower-indexed) edges grouped by their higher endpoint, once.
+    order_by_high = np.argsort(high, kind="stable")
+    sorted_high = high[order_by_high]
+    sorted_low = low[order_by_high]
+    incoming_counts = np.bincount(high, minlength=num_vertices)
+    incoming_starts = np.zeros(num_vertices + 1, dtype=np.int64)
+    incoming_starts[1:] = np.cumsum(incoming_counts)
 
-    # The contest only ever involves edges whose endpoints are both uncoloured, so the
-    # edge list is compacted as vertices colour in: the live set shrinks geometrically
-    # instead of being re-scanned in full every round.
-    live_src, live_dst = src, dst
-    while (colors < 0).any():
-        # A vertex loses if any uncoloured neighbour outranks it. Priorities are a
-        # permutation (unique), so the survivors are an independent set.
-        loser = np.zeros(num_vertices, dtype=bool)
-        loser[live_src[priority[live_src] < priority[live_dst]]] = True
-        winners = np.flatnonzero((colors < 0) & ~loser)
-
-        # Ragged gather of every winner's neighbour colours.
-        wdeg = degree[winners]
-        total = int(wdeg.sum())
-        seg_off = np.zeros(winners.size + 1, dtype=np.int64)
-        seg_off[1:] = np.cumsum(wdeg)
-        flat = np.repeat(csr_starts[winners], wdeg) + (
-            np.arange(total, dtype=np.int64) - np.repeat(seg_off[:-1], wdeg)
+    for wave_index in range(wave_bounds.size - 1):
+        wave = order_by_level[
+            wave_bounds[wave_index] : wave_bounds[wave_index + 1]
+        ]
+        wave = np.sort(wave)
+        degrees = incoming_counts[wave]
+        total = int(degrees.sum())
+        colors[wave] = 0  # no lower neighbours: colour 0
+        if total == 0:
+            continue
+        seg_off = np.zeros(wave.size + 1, dtype=np.int64)
+        seg_off[1:] = np.cumsum(degrees)
+        flat = np.repeat(incoming_starts[wave], degrees) + (
+            np.arange(total, dtype=np.int64) - np.repeat(seg_off[:-1], degrees)
         )
-        owner = np.repeat(np.arange(winners.size, dtype=np.int64), wdeg)
-        held = colors[csr_dst[flat]]
-        colored = held >= 0
-        owner, held = owner[colored], held[colored]
-
-        # Smallest colour absent from each winner's used set, vectorised: sort and dedupe
-        # the (winner, colour) pairs, and the answer is the first rank where the sorted
-        # colour run departs from 0, 1, 2, ... (or the run length if it never does).
-        colors[winners] = 0  # winners with no coloured neighbour take colour 0
-        if owner.size:
-            order = np.lexsort((held, owner))
-            owner, held = owner[order], held[order]
-            first = np.ones(owner.size, dtype=bool)
-            first[1:] = (owner[1:] != owner[:-1]) | (held[1:] != held[:-1])
-            owner, held = owner[first], held[first]
-            seg_starts = np.flatnonzero(
-                np.concatenate([[True], owner[1:] != owner[:-1]])
-            )
-            seg_lengths = np.diff(np.concatenate([seg_starts, [owner.size]]))
-            rank = np.arange(owner.size) - np.repeat(seg_starts, seg_lengths)
-            gap = np.where(held != rank, rank, owner.size)
-            first_gap = np.minimum.reduceat(gap, seg_starts)
-            colors[winners[owner[seg_starts]]] = np.where(
-                first_gap < owner.size, first_gap, seg_lengths
-            )
-
-        alive = (colors[live_src] < 0) & (colors[live_dst] < 0)
-        live_src, live_dst = live_src[alive], live_dst[alive]
+        owner = np.repeat(np.arange(wave.size, dtype=np.int64), degrees)
+        held = colors[sorted_low[flat]]
+        # Lower-indexed neighbours are all coloured (their level is strictly smaller).
+        # Smallest colour absent from each owner's used set: sort and dedupe the
+        # (owner, colour) pairs; the answer is the first rank where the sorted colour
+        # run departs from 0, 1, 2, ... (or the run length if it never does).
+        sort_order = np.lexsort((held, owner))
+        owner, held = owner[sort_order], held[sort_order]
+        first = np.ones(owner.size, dtype=bool)
+        first[1:] = (owner[1:] != owner[:-1]) | (held[1:] != held[:-1])
+        owner, held = owner[first], held[first]
+        seg_starts = np.flatnonzero(
+            np.concatenate([[True], owner[1:] != owner[:-1]])
+        )
+        seg_lengths = np.diff(np.concatenate([seg_starts, [owner.size]]))
+        rank = np.arange(owner.size) - np.repeat(seg_starts, seg_lengths)
+        gap = np.where(held != rank, rank, owner.size)
+        first_gap = np.minimum.reduceat(gap, seg_starts)
+        colors[wave[owner[seg_starts]]] = np.where(
+            first_gap < owner.size, first_gap, seg_lengths
+        )
 
     num_colors = int(colors.max()) + 1
     counts = np.bincount(colors, minlength=num_colors)
@@ -179,12 +175,12 @@ def build_vertex_coloring(tets: jnp.ndarray, num_vertices: int):
 
     color_groups = np.zeros((num_colors, max_group_size), dtype=np.int32)
     color_group_mask = np.zeros((num_colors, max_group_size), dtype=bool)
-    order = np.argsort(colors, kind="stable")  # groups vertices by colour, ascending index
+    group_order = np.argsort(colors, kind="stable")
     starts = np.zeros(num_colors, dtype=np.int64)
     starts[1:] = np.cumsum(counts)[:-1]
-    slots = np.arange(num_vertices, dtype=np.int64) - starts[colors[order]]
-    color_groups[colors[order], slots] = order
-    color_group_mask[colors[order], slots] = True
+    slots = np.arange(num_vertices, dtype=np.int64) - starts[colors[group_order]]
+    color_groups[colors[group_order], slots] = group_order
+    color_group_mask[colors[group_order], slots] = True
 
     return (
         jnp.asarray(color_groups),

@@ -1599,6 +1599,8 @@ class PaddedPairTests(unittest.TestCase):
             incident_contact_mask=jnp.ones_like(state.incident_contact_mask).at[0].set(
                 True
             ),
+            vertex_bounds=state.vertex_bounds,
+            bound_anchor=state.bound_anchor,
         )
 
         energy = lambda x: incident_pair_energy(
@@ -2088,7 +2090,9 @@ class ContactRecompilationTests(unittest.TestCase):
 
     def test_a_changing_pair_set_does_not_recompile_the_solver(self):
         # Approaching from clear air, so the pair set genuinely grows from step to step.
-        problem, state, _ = _two_blocks(gap=0.05, velocity=(0.0, 0.0, -2.0))
+        # The gap starts *outside* the speed-derived detection band (~0.057 at this
+        # velocity) and the blocks close ~0.01 per step, so candidates appear mid-run.
+        problem, state, _ = _two_blocks(gap=0.1, velocity=(0.0, 0.0, -2.0))
 
         live = lambda s: int(
             np.asarray(vbd.redetect_contacts(problem, s).contact.state.pair_valid).sum()
@@ -2098,11 +2102,21 @@ class ContactRecompilationTests(unittest.TestCase):
         state = vbd.step(problem, state)  # warm the trace cache
         counts.append(live(state))
 
-        before = vbd._advance_step._cache_size()
+        # The step loop is host code now (M3: detection can re-run mid-sweep), so the
+        # traces that must not grow are the jitted per-iteration kernels it drives.
+        from diff_vbd.solver.contact.bounds import truncate_to_bounds
+
+        before = (
+            vbd._accelerated_iteration._cache_size()
+            + truncate_to_bounds._cache_size()
+        )
         for _ in range(6):
             state = vbd.step(problem, state)
             counts.append(live(state))
-        after = vbd._advance_step._cache_size()
+        after = (
+            vbd._accelerated_iteration._cache_size()
+            + truncate_to_bounds._cache_size()
+        )
 
         # The pair set must actually change across these steps, or the test is vacuous: a
         # buffer whose contents never move could not recompile anything either way.
