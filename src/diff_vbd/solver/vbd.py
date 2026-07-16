@@ -9,11 +9,13 @@ from tqdm.auto import tqdm
 
 from diff_vbd.model import ContactState, SimulationProblem, SimulationState
 from diff_vbd.setup.boundary_conditions import evaluate_dirichlet_targets
-from diff_vbd.solver.contact.ccd import (
-    derive_detection_band,
-    filter_sweep,
-    vertex_time_of_impact,
+from diff_vbd.solver.contact.bounds import (
+    build_vertex_bounds,
+    derive_bounds_band,
+    redetection_threshold,
+    truncate_to_bounds,
 )
+from diff_vbd.solver.contact.ccd import vertex_time_of_impact
 from diff_vbd.solver.contact.detection import (
     build_contact_incidence,
     detect_contact_pairs,
@@ -26,10 +28,6 @@ from diff_vbd.solver.contact.potential import (
     incident_pair_min_gap,
 )
 from diff_vbd.solver.materials import tet_energy
-
-# Below this, the contact filter has throttled the sweep so hard that the mesh is not
-# actually advancing, and the run is silently dead rather than slow. See `_audit_step`.
-_MIN_USEFUL_TOI = 1.0e-6
 
 
 @jax.jit
@@ -379,143 +377,314 @@ def chebyshev_weight(
 
 
 @jax.jit
-def _sweep_positions_impl(
+def _accelerated_iteration(
+    problem: SimulationProblem,
+    current_position: jnp.ndarray,
+    previous_position: jnp.ndarray,
+    previous_weight: jnp.ndarray,
+    colliding: jnp.ndarray,
+    iteration_index: jnp.ndarray,
+    inertial_target: jnp.ndarray,
+    step_start: jnp.ndarray,
+    prescribed_position: jnp.ndarray,
+):
+    """One VBD iteration plus its (optional) Chebyshev update, jitted as a unit.
+
+    Returns ``(next_position, previous_for_next, next_weight, colliding)``. The host owns
+    the loop over iterations -- it has to, because the conservative-bound scheme re-runs
+    contact detection *mid-step* when enough vertices consume their bounds, and detection
+    is host code. Everything per-iteration stays on the device.
+    """
+    raw_position = _raw_vbd_iteration(
+        problem,
+        current_position,
+        inertial_target,
+        step_start,
+        prescribed_position,
+    )
+
+    # Once a vertex has been in contact at any point this step, it stays flagged: a
+    # vertex that is bouncing in and out of the activation band is exactly the one the
+    # extrapolation would destabilise.
+    colliding = colliding | colliding_vertex_mask(
+        problem.contact.params,
+        problem.contact.colliders,
+        problem.contact.state,
+        raw_position,
+    )
+
+    def apply_acceleration(_):
+        weight = chebyshev_weight(
+            iteration_index,
+            problem.solver.acceleration.chebyshev_rho,
+            previous_weight,
+        )
+        accelerated_position = previous_position + weight * (
+            raw_position - previous_position
+        )
+        # Colliding vertices take the un-extrapolated solve. This has to be a `where`
+        # rather than a second `cond`: the outer cond is a global on/off flag, while
+        # this gate is per vertex. The Chebyshev weight stays scalar and shared, so the
+        # recurrence itself is untouched.
+        accelerated_position = jnp.where(
+            colliding[:, None], raw_position, accelerated_position
+        )
+        accelerated_position = _apply_position_constraints(
+            problem, accelerated_position, prescribed_position
+        )
+        return accelerated_position, weight
+
+    def skip_acceleration(_):
+        return raw_position, jnp.asarray(1.0, dtype=raw_position.dtype)
+
+    next_position, next_weight = jax.lax.cond(
+        problem.solver.acceleration.enabled,
+        apply_acceleration,
+        skip_acceleration,
+        operand=None,
+    )
+    return next_position, current_position, next_weight, colliding
+
+
+def _locked_rows(problem: SimulationProblem) -> np.ndarray:
+    """Rows the truncation kernel must not clip: Dirichlet *and* rigid-region vertices.
+
+    Both are rewritten by ``_apply_position_constraints`` after any filter runs --
+    Dirichlet rows to their prescribed targets, rigid rows to the mass-weighted best-fit
+    rigid motion. Clipping a rigid row would not stick (the projection is dominated by
+    the region's unclipped far-field rows and drags the clipped vertex right back), and
+    counting its discarded clip toward the re-detection trigger would be noise. So
+    locked rows pass through untruncated, and ``_audit_locked_bounds`` is the
+    compensating control for **both** -- the review of this branch found rigid rows
+    covered by neither, which silently voided the certificate for a rigid body driven
+    into a deformable surface.
+    """
+    return np.asarray(problem.boundary_conditions.dirichlet_mask, dtype=bool) | (
+        np.asarray(problem.boundary_conditions.rigid_region_indices) >= 0
+    )
+
+
+def _audit_locked_bounds(
+    problem: SimulationProblem,
+    anchor: jnp.ndarray,
+    position: jnp.ndarray,
+) -> None:
+    """Raise if a locked (Dirichlet or rigid) vertex has outrun its conservative bound.
+
+    Locked rows are the ones the truncation kernel cannot bind: their positions are
+    rewritten after every filter -- prescribed rows to a boundary condition, rigid rows
+    to the region's best-fit rigid motion. That leaves exactly one way the per-vertex
+    certificate can fail: a locked vertex moving further from the anchor than its
+    bound, where a pair involving it could close unseen. This is the compensating
+    control, in the same register as the old E3 audit (which likewise named prescribed
+    *and* rigid motion as the two ways past the on-device clamp).
+    """
+    if not bool(problem.contact.ccd.enabled):
+        return
+    locked = _locked_rows(problem)
+    if not locked.any():
+        return
+    travelled = np.linalg.norm(
+        np.asarray(position) - np.asarray(anchor), axis=-1
+    )
+    bounds = np.asarray(problem.contact.state.vertex_bounds)
+    violating = locked & (travelled > bounds)
+    if violating.any():
+        vertex = int(np.argmax(np.where(violating, travelled - bounds, -np.inf)))
+        kind = (
+            "prescribed"
+            if bool(problem.boundary_conditions.dirichlet_mask[vertex])
+            else "rigid-region"
+        )
+        raise ValueError(
+            f"{kind} vertex {vertex} moved {travelled[vertex]:g} since the last "
+            f"contact detection, but its conservative bound is {bounds[vertex]:g}. The "
+            f"per-vertex intersection-free certificate (Wu et al. 2020) needs every "
+            f"vertex -- prescribed and rigid ones included -- to stay within its bound "
+            f"between detections; the solver clips its own proposals but cannot clip a "
+            f"boundary condition or a rigid projection. At this speed a contact pair "
+            f"involving this vertex could have closed to zero unseen. Reduce solver.dt, "
+            f"or slow the prescribed motion."
+        )
+
+
+def _sweep_positions_host(
     problem: SimulationProblem,
     state: SimulationState,
     prescribed_position: jnp.ndarray,
-) -> jnp.ndarray:
-    """Perform fixed color-parallel iterations over the mesh."""
+) -> tuple[SimulationProblem, jnp.ndarray]:
+    """Run the step's iterations, enforcing per-vertex bounds, re-detecting as needed.
+
+    The intersection-free guarantee now lives here, in three moves per iteration
+    (Wu et al. 2020; OGC Algorithm 3):
+
+    * every displacement the solver produces -- the initial guess included, since the
+      inertial jump happens before a single sweep runs and can be far larger than any
+      gap -- is truncated per vertex so no vertex strays further than its bound from the
+      position recorded at the last detection. Truncation happens *after* the Chebyshev
+      update, so it bounds where the mesh actually ended up;
+    * displacement is cumulative from the last detection, not per iteration -- K
+      iterations must not buy K times the certified distance;
+    * when at least ``max(1, GAMMA_E * K)`` vertices have consumed their bounds,
+      detection re-runs at the current positions, which re-anchors every vertex with
+      fresh distances. A pinned vertex is *locally* pinned until then: nothing else in
+      the mesh is slowed, which is the entire point of replacing the global filter.
+
+    Returns the (possibly re-detected) problem alongside the positions, so the caller
+    keeps the refreshed pair set for its end-of-step audit.
+    """
     inertial_target = predict_inertial_target(problem, state)
+    contact_active = bool(problem.contact.params.enabled)
+    # The bound bookkeeping (exceeded counter, re-detection, locked-row audit) exists
+    # only on the mesh-mesh path; collider-only problems keep the per-vertex collider
+    # clip but skip the per-iteration host synchronisation the counter would force.
+    bounds_active = contact_active and bool(problem.contact.ccd.enabled)
+    threshold = redetection_threshold(int(state.position.shape[0]))
+    anchor = state.position
+
+    # Free-for-truncation excludes rigid rows as well as Dirichlet ones: both are
+    # rewritten by the position constraints after every filter, so a clip would not
+    # stick and its count would be noise. The locked-row audit covers them instead.
+    truncation_mask = jnp.asarray(~_locked_rows(problem))
+
+    dirichlet = problem.boundary_conditions.dirichlet_mask.astype(bool)
+    num_iterations = int(problem.solver.iteration_schedule.shape[0])
+
+    def prescribed_at(iteration):
+        """The prescribed target, applied in per-iteration increments under bounds.
+
+        A boundary condition cannot be truncated, and applying the whole step's
+        prescribed jump at the initial guess means one increment of size ``v * dt`` has
+        to fit inside a single conservative bound -- which caps scripted motion near
+        contact at speeds far below what the old global filter handled. Interpolating
+        the prescription across the sweep divides that requirement by the iteration
+        count: each increment is checked against a (re-detectable, re-anchorable)
+        budget, and the final iteration lands exactly on the full target. Without
+        bounds in play the full target is applied immediately, exactly as before.
+        """
+        if not bounds_active:
+            return prescribed_position
+        fraction = min(1.0, (iteration + 1) / num_iterations)
+        interpolated = state.position + fraction * (
+            prescribed_position - state.position
+        )
+        return jnp.where(dirichlet[:, None], interpolated, prescribed_position)
+
+    dirichlet_np = np.asarray(dirichlet)
+
+    def ensure_prescribed_budget(problem, anchor, position, target, exceeded):
+        """Re-detect (re-anchor) if the next prescribed increment would breach a bound.
+
+        Runs strictly *before* the increment is applied, because afterwards is too late
+        -- the motion would already have happened, and the next detection would find an
+        intersected state and crash with a misleading E1 error instead of naming the
+        real cause. One re-detection (at the still-valid current positions) buys a
+        fresh anchor and fresh distances; if even a fresh budget cannot absorb a single
+        increment, the raise here -- pre-emptive, with the vertex and the fix named --
+        is the honest outcome.
+        """
+        if not bounds_active:
+            return problem, anchor, exceeded
+
+        def breached(current_problem, current_anchor):
+            travelled = np.linalg.norm(
+                np.asarray(target) - np.asarray(current_anchor), axis=-1
+            )
+            bounds = np.asarray(current_problem.contact.state.vertex_bounds)
+            return dirichlet_np & (travelled > bounds), travelled, bounds
+
+        rows, _, _ = breached(problem, anchor)
+        if rows.any():
+            problem = _redetect_at_positions(problem, position, prescribed_position)
+            anchor = position
+            exceeded = 0
+            rows, travelled, bounds = breached(problem, anchor)
+            if rows.any():
+                vertex = int(
+                    np.argmax(np.where(rows, travelled - bounds, -np.inf))
+                )
+                raise ValueError(
+                    f"prescribed vertex {vertex} would move {travelled[vertex]:g} in "
+                    f"one sweep iteration, but even a freshly detected conservative "
+                    f"bound there is only {bounds[vertex]:g}. The per-vertex "
+                    f"intersection-free certificate (Wu et al. 2020) needs every "
+                    f"vertex to stay within its bound between detections, and a "
+                    f"boundary condition cannot be truncated -- at this speed a "
+                    f"contact pair involving this vertex could close to zero unseen. "
+                    f"Reduce solver.dt, raise solver.num_iterations (the prescription "
+                    f"is applied in per-iteration increments), or slow the prescribed "
+                    f"motion."
+                )
+        return problem, anchor, exceeded
+
+    # The budget check must precede _compute_initial_position: the guess is what first
+    # writes the prescribed rows, and a veto after the fact is no veto at all.
+    initial_prescribed = prescribed_at(0)
+    exceeded = 0
+    problem, anchor, exceeded = ensure_prescribed_budget(
+        problem, anchor, state.position, initial_prescribed, exceeded
+    )
     initial_position = _compute_initial_position(
-        problem, state, inertial_target, prescribed_position
-    )
-    # The displacement clamp binds only the vertices the solver is actually free to move.
-    # A prescribed row is overwritten after the filter anyway, so clamping it would freeze
-    # the mesh to no purpose; `_audit_step` on the host covers those instead.
-    free_mask = ~problem.boundary_conditions.dirichlet_mask.astype(bool)
-
-    # The *initial guess* has to be filtered too, and this is easy to miss. The guess is the
-    # inertial target -- where the mesh would go with no forces at all -- and it is taken in
-    # one jump, before a single sweep runs. At speed that jump is far larger than the gap: a
-    # body moving at 20 m/s with dt = 5 ms starts the solve 0.1 units *inside* whatever it was
-    # about to hit. Every filter downstream measures from this configuration, so if it is
-    # already intersecting they are all certifying motion from an invalid state, and the
-    # guarantee is void before the first iteration.
-    initial_position, initial_toi = filter_sweep(
-        problem.contact,
-        problem.contact.state,
-        state.position,
-        state.position,
-        initial_position,
-        free_mask,
-    )
-    initial_position = _apply_position_constraints(
-        problem, initial_position, prescribed_position
+        problem, state, inertial_target, initial_prescribed
     )
 
-    def iteration_step(carry, iteration_index):
-        (
-            current_position,
-            previous_position,
-            previous_weight,
-            colliding,
-            min_toi,
-        ) = carry
-        raw_position = _raw_vbd_iteration(
-            problem,
-            current_position,
-            inertial_target,
-            state.position,
-            prescribed_position,
+    position = initial_position
+    if contact_active:
+        position, count = truncate_to_bounds(
+            problem.contact, anchor, state.position, initial_position, truncation_mask
+        )
+        if bounds_active:
+            exceeded = int(count)
+    position = _apply_position_constraints(problem, position, initial_prescribed)
+    if bounds_active:
+        _audit_locked_bounds(problem, anchor, position)
+
+    previous_position = position
+    previous_weight = jnp.asarray(1.0, dtype=position.dtype)
+    colliding = jnp.zeros((position.shape[0],), dtype=jnp.bool_)
+
+    for index in range(num_iterations):
+        if bounds_active and exceeded >= threshold:
+            problem = _redetect_at_positions(problem, position, prescribed_position)
+            anchor = position
+            exceeded = 0
+
+        step_prescribed = prescribed_at(index)
+        problem, anchor, exceeded = ensure_prescribed_budget(
+            problem, anchor, position, step_prescribed, exceeded
         )
 
-        # Once a vertex has been in contact at any point this step, it stays flagged: a
-        # vertex that is bouncing in and out of the activation band is exactly the one the
-        # extrapolation would destabilise.
-        colliding = colliding | colliding_vertex_mask(
-            problem.contact.params,
-            problem.contact.colliders,
-            problem.contact.state,
-            raw_position,
-        )
-
-        def apply_acceleration(_):
-            weight = chebyshev_weight(
-                iteration_index,
-                problem.solver.acceleration.chebyshev_rho,
+        next_position, previous_position, previous_weight, colliding = (
+            _accelerated_iteration(
+                problem,
+                position,
+                previous_position,
                 previous_weight,
+                colliding,
+                jnp.asarray(index, dtype=jnp.int32),
+                inertial_target,
+                state.position,
+                step_prescribed,
             )
-            accelerated_position = previous_position + weight * (
-                raw_position - previous_position
-            )
-            # Colliding vertices take the un-extrapolated solve. This has to be a `where`
-            # rather than a second `cond`: the outer cond is a global on/off flag, while
-            # this gate is per vertex. The Chebyshev weight stays scalar and shared, so the
-            # recurrence itself is untouched.
-            accelerated_position = jnp.where(
-                colliding[:, None], raw_position, accelerated_position
-            )
-            accelerated_position = _apply_position_constraints(
-                problem, accelerated_position, prescribed_position
-            )
-            return accelerated_position, weight
-
-        def skip_acceleration(_):
-            return raw_position, jnp.asarray(1.0, dtype=raw_position.dtype)
-
-        next_position, next_weight = jax.lax.cond(
-            problem.solver.acceleration.enabled,
-            apply_acceleration,
-            skip_acceleration,
-            operand=None,
         )
 
-        # The guarantee. Bound the sweep's *aggregate* displacement, not each vertex's own
-        # step: a vertex only ever certified its motion against a frozen snapshot, and this
-        # is where the mesh actually ended up. It is also the only thing that sees the
-        # Chebyshev extrapolation, which runs after every local solve has finished and can
-        # otherwise fling a vertex clean through an obstacle the local solves respected.
-        #
-        # `state.position` -- the step start -- is not the same as `current_position`, the
-        # start of this sweep. The displacement clamp inside measures from the former,
-        # because the detection band it is defending was built there.
-        next_position, toi = filter_sweep(
-            problem.contact,
-            problem.contact.state,
-            state.position,
-            current_position,
-            next_position,
-            free_mask,
-        )
-        min_toi = jnp.minimum(min_toi, toi)
-        # Re-assert Dirichlet/rigid afterwards: the scaling above must not drag a
+        if contact_active:
+            next_position, count = truncate_to_bounds(
+                problem.contact, anchor, position, next_position, truncation_mask
+            )
+            if bounds_active:
+                exceeded += int(count)
+        # Re-assert Dirichlet/rigid afterwards: the truncation must not drag a
         # kinematically prescribed vertex off its target.
         next_position = _apply_position_constraints(
-            problem, next_position, prescribed_position
+            problem, next_position, step_prescribed
         )
-        return (
-            next_position,
-            current_position,
-            next_weight,
-            colliding,
-            min_toi,
-        ), None
+        if bounds_active:
+            _audit_locked_bounds(problem, anchor, next_position)
+        position = next_position
 
-    final_carry, _ = jax.lax.scan(
-        iteration_step,
-        (
-            initial_position,
-            initial_position,
-            jnp.asarray(1.0, dtype=initial_position.dtype),
-            jnp.zeros((initial_position.shape[0],), dtype=jnp.bool_),
-            initial_toi,
-        ),
-        problem.solver.iteration_schedule,
-    )
-    next_position, _, _, _, min_toi = final_carry
-    return (
-        _apply_position_constraints(problem, next_position, prescribed_position),
-        min_toi,
+    return problem, _apply_position_constraints(
+        problem, position, prescribed_position
     )
 
 
@@ -525,7 +694,7 @@ def sweep_positions(
     prescribed_position: jnp.ndarray,
 ) -> jnp.ndarray:
     """Perform fixed color-parallel iterations over the mesh."""
-    positions, _ = _sweep_positions_impl(problem, state, prescribed_position)
+    _, positions = _sweep_positions_host(problem, state, prescribed_position)
     return positions
 
 
@@ -545,33 +714,73 @@ def update_velocity(
     )
 
 
-@jax.jit
 def _advance_step(
     problem: SimulationProblem,
     state: SimulationState,
     prescribed_position: jnp.ndarray,
     prescribed_velocity: jnp.ndarray,
-) -> tuple[SimulationState, jnp.ndarray]:
-    """Advance the mesh by one timestep, and report the sweep's tightest time of impact.
-
-    The time of impact comes back out because a collapsing bound is a *silent* failure: the
-    mesh simply stops moving, and that is indistinguishable from "contact is slow". The host
-    is the only place that can say so.
-    """
-    next_position, min_toi = _sweep_positions_impl(
+) -> SimulationState:
+    """Advance the mesh by one timestep. Host code: the sweep inside re-runs detection."""
+    problem, next_position = _sweep_positions_host(
         problem, state, prescribed_position
     )
     next_velocity = update_velocity(
         problem, state, next_position, prescribed_velocity
     )
-    return (
-        SimulationState(
-            position=next_position,
-            velocity=next_velocity,
-            time=state.time + problem.solver.dt,
-        ),
-        min_toi,
+    return SimulationState(
+        position=next_position,
+        velocity=next_velocity,
+        time=state.time + problem.solver.dt,
     )
+
+
+def _rebuild_contact_state(
+    problem: SimulationProblem,
+    positions: np.ndarray,
+    band: float,
+) -> SimulationProblem:
+    """Detect pairs at ``positions`` and install the pair set, bounds and anchor."""
+    capacity = problem.contact.state.pair_vertices.shape[0]
+    max_per_vertex = problem.contact.state.incident_contacts.shape[1]
+    d_hat = float(problem.contact.params.d_hat)
+
+    pair_vertices, pair_type, pair_valid, pair_distances = detect_contact_pairs(
+        positions,
+        np.asarray(problem.contact.surface_triangles),
+        np.asarray(problem.contact.surface_edges),
+        d_hat=d_hat,
+        capacity=capacity,
+        band=band,
+    )
+    incidence, mask = build_contact_incidence(
+        pair_vertices, pair_valid, positions.shape[0], max_per_vertex
+    )
+    surface_vertices = np.unique(np.asarray(problem.contact.surface_triangles))
+    bounds = build_vertex_bounds(
+        pair_vertices,
+        pair_valid,
+        pair_distances,
+        positions.shape[0],
+        band,
+        surface_vertices,
+    )
+
+    dtype = problem.contact.ccd.slack.dtype
+    contact_state = ContactState(
+        pair_vertices=jnp.asarray(pair_vertices, dtype=jnp.int32),
+        pair_type=jnp.asarray(pair_type, dtype=jnp.int32),
+        pair_valid=jnp.asarray(pair_valid, dtype=jnp.bool_),
+        incident_contacts=jnp.asarray(incidence, dtype=jnp.int32),
+        incident_contact_mask=jnp.asarray(mask, dtype=jnp.bool_),
+        vertex_bounds=jnp.asarray(bounds, dtype=dtype),
+        bound_anchor=jnp.asarray(positions, dtype=dtype),
+    )
+    ccd = dataclasses.replace(
+        problem.contact.ccd,
+        detection_band=jnp.asarray(band, dtype=dtype),
+    )
+    contact = dataclasses.replace(problem.contact, state=contact_state, ccd=ccd)
+    return dataclasses.replace(problem, contact=contact)
 
 
 def redetect_contacts(
@@ -582,28 +791,26 @@ def redetect_contacts(
     """Rebuild the mesh-mesh contact set on the host and return an updated problem.
 
     This is the boundary between the two layers. Detection is combinatorial -- integer
-    indices, an active set, a classification -- so it runs here, in Python, between jitted
-    sweeps, and everything it produces is frozen data by the time the device sees it.
+    indices, an active set, a classification, per-vertex bounds -- so it runs here, in
+    Python, between jitted sweeps, and everything it produces is frozen data by the time
+    the device sees it.
 
     The rebuilt buffers keep the same shapes, so this is a jit cache hit rather than a
     recompile. That is the whole reason the capacity is fixed and overflow is an error: a
     capacity that grew with the contact count would recompile the solver every step.
 
-    The detection *band* is derived here, from how far the mesh is about to move, and written
-    into ``CcdParams`` alongside the displacement clamp that enforces it. The two are computed
-    together, in this one place, because they are only sound as a matched pair: the band is
-    wide enough to catch every pair that could reach contact **only because** the clamp stops
-    any vertex travelling further than the band was sized for. Split them up and the guarantee
-    quietly evaporates. Both are scalar array leaves, so refreshing them every step is a jit
-    cache hit like the buffers themselves.
+    The detection *band* is derived here, from how far the mesh is about to move. Under
+    the conservative-bound scheme it is a performance parameter, not a guarantee one
+    (see ``contact.bounds``): it sizes the far-field vertices' bounds so a step's
+    expected motion fits in one detection interval, and it has to cover the prescribed
+    (Dirichlet) motion because those rows cannot be truncated -- an undersized band
+    would trip the prescribed-bounds audit rather than lose the guarantee.
     """
     if not bool(problem.contact.params.enabled):
         return problem
     if problem.contact.surface_triangles.shape[0] == 0:
         return problem  # analytic colliders only: nothing combinatorial to do
 
-    capacity = problem.contact.state.pair_vertices.shape[0]
-    max_per_vertex = problem.contact.state.incident_contacts.shape[1]
     positions = np.asarray(state.position)
     d_hat = float(problem.contact.params.d_hat)
 
@@ -621,82 +828,25 @@ def redetect_contacts(
             moved = np.asarray(prescribed_position)[dirichlet] - positions[dirichlet]
             prescribed = float(np.max(np.linalg.norm(moved, axis=-1), initial=0.0))
 
-    band, max_displacement = derive_detection_band(d_hat, predicted, prescribed)
-
-    pair_vertices, pair_type, pair_valid = detect_contact_pairs(
-        positions,
-        np.asarray(problem.contact.surface_triangles),
-        np.asarray(problem.contact.surface_edges),
-        d_hat=d_hat,
-        capacity=capacity,
-        band=band,
-    )
-    incidence, mask = build_contact_incidence(
-        pair_vertices, pair_valid, positions.shape[0], max_per_vertex
-    )
-
-    contact_state = ContactState(
-        pair_vertices=jnp.asarray(pair_vertices, dtype=jnp.int32),
-        pair_type=jnp.asarray(pair_type, dtype=jnp.int32),
-        pair_valid=jnp.asarray(pair_valid, dtype=jnp.bool_),
-        incident_contacts=jnp.asarray(incidence, dtype=jnp.int32),
-        incident_contact_mask=jnp.asarray(mask, dtype=jnp.bool_),
-    )
-    dtype = problem.contact.ccd.slack.dtype
-    ccd = dataclasses.replace(
-        problem.contact.ccd,
-        max_displacement=jnp.asarray(max_displacement, dtype=dtype),
-        detection_band=jnp.asarray(band, dtype=dtype),
-    )
-    contact = dataclasses.replace(problem.contact, state=contact_state, ccd=ccd)
-    return dataclasses.replace(problem, contact=contact)
+    band = derive_bounds_band(d_hat, predicted, prescribed)
+    return _rebuild_contact_state(problem, positions, band)
 
 
-def _audit_step(
+def _redetect_at_positions(
     problem: SimulationProblem,
-    start_position: jnp.ndarray,
-    end_position: jnp.ndarray,
-    min_toi: jnp.ndarray,
-) -> None:
-    """E3 and E4: the two ways the mesh-mesh guarantee can fail without anyone noticing."""
-    if not bool(problem.contact.ccd.enabled):
-        return
+    positions: jnp.ndarray,
+    prescribed_position: jnp.ndarray,
+) -> SimulationProblem:
+    """Mid-sweep re-detection: fresh pairs, bounds and anchor at the current iterate.
 
+    Reuses the band the step started with: it was sized for the whole step's motion, so
+    it over-covers any remaining fraction of it. Runs only when enough vertices have
+    consumed their bounds, so its cost is proportional to how much contact is actually
+    happening -- a quiet mesh re-detects once per step, exactly as before.
+    """
+    del prescribed_position  # the step-start band already covered the prescribed motion
     band = float(problem.contact.ccd.detection_band)
-    d_hat = float(problem.contact.params.d_hat)
-    travelled = np.linalg.norm(
-        np.asarray(end_position) - np.asarray(start_position), axis=-1
-    )
-    worst = float(np.max(travelled, initial=0.0))
-
-    # E3. The on-device clamp binds only the free vertices, because the position constraints
-    # overwrite Dirichlet and rigid rows *after* the filter runs -- so a prescribed motion or
-    # a rigid lever arm can still carry a vertex further than the band was sized for. This is
-    # the compensating control for that one hole.
-    if 2.0 * worst >= band - d_hat:
-        vertex = int(np.argmax(travelled))
-        raise ValueError(
-            f"vertex {vertex} moved {worst:g} this step, but the contact pair set was built "
-            f"with a band of {band:g} against an activation distance of {d_hat:g}. The "
-            f"guarantee needs 2 * displacement < band - d_hat: a pair further apart than the "
-            f"band is not in the set, so nothing is watching it, and at this speed one could "
-            f"have closed to zero unseen. The usual cause is a prescribed (Dirichlet) or "
-            f"rigid motion, which the sweep's clamp cannot bind because the constraints are "
-            f"re-applied after it. Reduce solver.dt, or slow the prescribed motion."
-        )
-
-    # E4. A time of impact at zero is a mesh that has stopped moving -- which looks exactly
-    # like "contact is just slow" and will be debugged as a performance problem for a day.
-    if float(min_toi) < _MIN_USEFUL_TOI:
-        raise ValueError(
-            f"the contact time-of-impact filter collapsed to {float(min_toi):g} this step, so "
-            f"the sweep made essentially no progress and the mesh is frozen. Either something "
-            f"is being driven into an obstacle from ~zero distance, or ACCD is grinding: its "
-            f"advance is proportional to the gap, so two surfaces sliding past each other fast "
-            f"at a tiny separation need far more iterations than the budget allows. Reduce "
-            f"solver.dt, raise contact.d_hat, or disable self_collision_ccd (which forfeits "
-            f"the intersection-free guarantee)."
-        )
+    return _rebuild_contact_state(problem, np.asarray(positions), band)
 
 
 def step(
@@ -707,14 +857,10 @@ def step(
     prescribed_position, prescribed_velocity = evaluate_dirichlet_targets(
         problem.boundary_conditions, float(state.time), float(problem.solver.dt)
     )
-    # Detection needs the prescribed targets: a Dirichlet vertex's motion is known exactly,
-    # and it has to be inside the band the pair set is built with.
+    # Detection needs the prescribed targets: a Dirichlet vertex's whole-step motion is
+    # known exactly, and the band must be wide enough that its bound covers it.
     problem = redetect_contacts(problem, state, prescribed_position)
-    next_state, min_toi = _advance_step(
-        problem, state, prescribed_position, prescribed_velocity
-    )
-    _audit_step(problem, state.position, next_state.position, min_toi)
-    return next_state
+    return _advance_step(problem, state, prescribed_position, prescribed_velocity)
 
 
 def _stack_state_history(history: list[SimulationState]) -> SimulationState:

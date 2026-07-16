@@ -256,8 +256,17 @@ def _validate_contact_conditioning(rest_positions: jnp.ndarray, d_hat: float):
         )
 
 
-def empty_contact_state(num_vertices: int, capacity: int, max_per_vertex: int):
-    """Return a zeroed, fully-invalid contact state of the given fixed capacity."""
+def empty_contact_state(
+    num_vertices: int, capacity: int, max_per_vertex: int, dtype=jnp.float64
+):
+    """Return a zeroed, fully-invalid contact state of the given fixed capacity.
+
+    The bounds start ``UNBOUNDED`` and the anchor at zero: both are populated by the
+    first detection, which ``step`` always runs before any vertex moves, so the empty
+    state never certifies anything -- it only has to be shape-compatible and inert.
+    """
+    from diff_vbd.solver.contact.bounds import UNBOUNDED
+
     return ContactState(
         pair_vertices=jnp.zeros((capacity, 4), dtype=jnp.int32),
         pair_type=jnp.zeros((capacity,), dtype=jnp.int32),
@@ -266,6 +275,8 @@ def empty_contact_state(num_vertices: int, capacity: int, max_per_vertex: int):
         incident_contact_mask=jnp.zeros(
             (num_vertices, max_per_vertex), dtype=jnp.bool_
         ),
+        vertex_bounds=jnp.full((num_vertices,), UNBOUNDED, dtype=dtype),
+        bound_anchor=jnp.zeros((num_vertices, 3), dtype=dtype),
     )
 
 
@@ -387,10 +398,9 @@ def _build_contact_data(
 
     ccd = CcdParams(
         slack=jnp.asarray(ccd_slack, dtype=dtype),
-        # Both are refreshed from the mesh's actual motion at every detection. These are the
-        # at-rest values: a body that is not moving may still travel d_hat, and the band is
-        # then the usual 2 * d_hat.
-        max_displacement=jnp.asarray(d_hat, dtype=dtype),
+        # Refreshed from the mesh's actual motion at every detection; this is the at-rest
+        # value: a body that is not moving may still travel d_hat, and the band is then
+        # the usual 2 * d_hat.
         detection_band=jnp.asarray(2.0 * d_hat, dtype=dtype),
         enabled=jnp.asarray(self_collision and self_collision_ccd, dtype=jnp.bool_),
     )
@@ -398,7 +408,7 @@ def _build_contact_data(
     return ContactData(
         params=params,
         colliders=collider_data,
-        state=empty_contact_state(num_vertices, capacity, max_per_vertex),
+        state=empty_contact_state(num_vertices, capacity, max_per_vertex, dtype=dtype),
         ccd=ccd,
         surface_triangles=triangles,
         surface_edges=edges,

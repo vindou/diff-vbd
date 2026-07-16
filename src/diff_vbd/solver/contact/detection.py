@@ -182,21 +182,27 @@ def detect_contact_pairs(
     band: float | None = None,
     inflation: float = 2.0,
 ):
-    """Return padded vertex-triangle and edge-edge pair buffers within ``band``.
+    """Return padded pair buffers within ``band``, plus each pair's distance.
+
+    Four padded arrays: ``(pair_vertices, pair_type, pair_valid, pair_distance)``. The
+    distances come straight out of the narrow phase -- the very numbers the E1 check is
+    made from -- and exist because the per-vertex conservative bounds (Wu et al. 2020,
+    ``contact.bounds``) are built from them: a vertex's bound is a fraction of its
+    minimal candidate-pair distance. Padded slots carry a distance of ``inf`` so they
+    can never be the minimum.
 
     Primitives that *share a vertex* are skipped. They are adjacent by construction -- a
     vertex always touches its own triangles -- so their distance is zero and the barrier
     would be infinite. This is the difference between self-collision and self-adjacency,
     and conflating them makes a mesh explode on the first step.
 
-    ``band`` is the detection radius, and it is a **guarantee parameter, not a tuning knob**.
-    A pair further apart than ``band`` at the start of the step is absent from the returned
-    set, and therefore invisible to the CCD for the whole step -- so it could close to zero
-    and tunnel with nothing watching. The band is only sound if no vertex can move far enough
-    to bring such a pair into contact, which is the inequality ``band >= d_hat + 2 * Δmax``
-    that ``ccd.derive_detection_band`` computes and the sweep's displacement clamp enforces.
-    Pass the derived band; the ``inflation * d_hat`` fallback is for callers that have no
-    motion (detection at rest, and the tests).
+    ``band`` is the detection radius. Under the conservative-bound scheme it is a
+    **performance knob, not a soundness parameter**: a pair beyond the band is more than
+    ``band`` apart, and every bound is capped at ``GAMMA_P * band < band / 2`` per side,
+    so an undetected pair cannot close before the next detection no matter what the
+    solver does. A wider band buys roomier bounds and fewer re-detections; it cannot buy
+    an intersection. The ``inflation * d_hat`` fallback is for callers with no motion
+    estimate (detection at rest, and the tests).
     """
     positions = np.asarray(positions, dtype=np.float64)
     triangles = np.asarray(surface_triangles, dtype=np.int64).reshape(-1, 3)
@@ -293,6 +299,7 @@ def detect_contact_pairs(
     # this step a thin mesh reports hundreds of "contacts" at rest. Reuse the very same
     # distance kernel the barrier uses, so detection and energy cannot disagree about how
     # far apart two primitives are.
+    squared = np.empty((0,), dtype=np.float64)
     if pair_types.size:
         pair_vertices, pair_types, squared = _narrow_phase(
             positions, pair_vertices, pair_types, band
@@ -306,22 +313,25 @@ def detect_contact_pairs(
             f"other but the buffers hold {capacity}.\n"
             f"The band is {band:g} against an activation distance of {d_hat:g}. A band far "
             f"larger than d_hat means the band is being driven by *speed*, not proximity: it "
-            f"has to cover everything the mesh could reach this step, or a pair could close "
-            f"from outside the set and tunnel unseen. So the usual fix is not a bigger "
-            f"buffer -- it is less motion per step. Reduce solver.dt, or accept the cost and "
-            f"raise contact.capacity (which recompiles the solver, so choose it once with "
-            f"headroom)."
+            f"has to cover everything the mesh could reach this step, so that far-field "
+            f"vertices keep roomy conservative bounds. Reduce solver.dt, or accept the cost "
+            f"and raise contact.capacity (which recompiles the solver, so choose it once "
+            f"with headroom)."
         )
 
     padded_vertices = np.full((capacity, 4), _PAD, dtype=np.int32)
     padded_types = np.zeros((capacity,), dtype=np.int32)
     valid = np.zeros((capacity,), dtype=bool)
+    # Padded distance is +inf, not 0: these feed a minimum in the bound builder, and a
+    # padded slot at distance 0 would zero every bound it touches.
+    distances = np.full((capacity,), np.inf, dtype=np.float64)
     if found:
         padded_vertices[:found] = np.asarray(pair_vertices, dtype=np.int32)
         padded_types[:found] = np.asarray(pair_types, dtype=np.int32)
         valid[:found] = True
+        distances[:found] = np.sqrt(np.maximum(squared, 0.0))
 
-    return padded_vertices, padded_types, valid
+    return padded_vertices, padded_types, valid, distances
 
 
 def build_contact_incidence(

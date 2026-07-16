@@ -11,6 +11,7 @@ red rather than merely look wrong:
 * a solver path that bypasses the barrier entirely and tunnels straight through.
 """
 
+import dataclasses
 import unittest
 import warnings
 
@@ -30,13 +31,15 @@ from diff_vbd.solver.contact.barrier import (
     penalty_energy,
     two_stage_energy,
 )
-from diff_vbd.solver.contact.ccd import (
-    collider_sweep_time_of_impact,
-    derive_detection_band,
-    displacement_clamp_time_of_impact,
-    pair_time_of_impact,
-    vertex_time_of_impact,
+from diff_vbd.solver.contact.bounds import (
+    GAMMA_P,
+    UNBOUNDED,
+    build_vertex_bounds,
+    derive_bounds_band,
+    redetection_threshold,
+    truncate_to_bounds,
 )
+from diff_vbd.solver.contact.ccd import vertex_time_of_impact
 from diff_vbd.solver.contact.colliders import (
     plane_signed_distance,
     sphere_signed_distance,
@@ -727,14 +730,27 @@ class TimeOfImpactTests(unittest.TestCase):
             float(vertex_time_of_impact(self.colliders, start, end)), 1.0, places=9
         )
 
-    def test_resting_vertex_does_not_throttle_the_whole_sweep(self):
-        """The global filter is one scalar for the entire mesh, so a vertex already resting
-        in contact must not drag it to zero and freeze everything."""
-        positions = jnp.array([[0.0, 0.0, 1.0e-5], [0.0, 0.0, 1.0]])
-        # The resting vertex barely moves; the free one moves a long way, away from the plane.
-        moved = jnp.array([[0.0, 0.0, 1.0e-5], [0.0, 0.0, 2.0]])
-        toi = float(collider_sweep_time_of_impact(self.colliders, positions, moved))
-        self.assertAlmostEqual(toi, 1.0, places=6)
+    def test_a_resting_vertex_does_not_restrict_another_vertex(self):
+        """Collider clipping is per vertex: one vertex resting against the plane, another
+        moving a long way parallel to it. Under the old global sweep minimum this was a
+        deliberate no-throttle special case; per-vertex, it is true by construction, and
+        the assertion is that each vertex gets *its own* time of impact."""
+        resting = float(
+            vertex_time_of_impact(
+                self.colliders,
+                jnp.array([0.0, 0.0, 1.0e-5]),
+                jnp.array([0.0, 0.0, 1.0e-5]),
+            )
+        )
+        travelling = float(
+            vertex_time_of_impact(
+                self.colliders,
+                jnp.array([0.0, 0.0, 1.0]),
+                jnp.array([10.0, 0.0, 1.0]),
+            )
+        )
+        self.assertAlmostEqual(resting, 1.0, places=6)
+        self.assertAlmostEqual(travelling, 1.0, places=6)
 
     def test_no_colliders_yields_an_unrestricted_step(self):
         positions, tets = _block()
@@ -742,8 +758,8 @@ class TimeOfImpactTests(unittest.TestCase):
         free = free.at[0].set(0.0)  # needs a Dirichlet vertex when there is no collider
         problem = assemble_problem(positions, tets, free)
         toi = float(
-            collider_sweep_time_of_impact(
-                problem.contact.colliders, positions, positions + 100.0
+            vertex_time_of_impact(
+                problem.contact.colliders, positions[0], positions[0] + 100.0
             )
         )
         self.assertEqual(toi, 1.0)
@@ -1151,207 +1167,271 @@ def _pair_gap(points, pair_type):
 _TRIANGLE = ([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
 
 
-class PairTimeOfImpactTests(unittest.TestCase):
-    """ACCD: the mesh-mesh intersection-free guarantee, at the kernel level."""
+class ConservativeBoundTests(unittest.TestCase):
+    """Per-vertex conservative bounds (Wu et al. 2020): the mesh-mesh guarantee.
 
-    def _toi(self, start, end, pair_type, valid=TRUE):
-        return float(
-            pair_time_of_impact(start, end, jnp.int32(pair_type), valid, SLACK)
+    The composability fuzz is the load-bearing test. The old global filter existed on
+    the argument that per-vertex certificates cannot compose when both sides of a pair
+    move; Wu's factor of one half is the answer, and the fuzz drives every vertex of a
+    detected configuration by *exactly* its bound in adversarial directions and asserts
+    no pair distance reaches zero. If someone ever raises GAMMA_P to 0.5 or breaks the
+    band cap, this is the test that goes red.
+    """
+
+    def _detected(self, gap=2.0e-3, band=None, n=2):
+        problem, state, n_lower = _two_blocks(gap=gap, n=n)
+        positions = np.asarray(state.position)
+        band = 4.0 * gap if band is None else band
+        pair_vertices, pair_type, pair_valid, distances = detect_contact_pairs(
+            positions,
+            np.asarray(problem.contact.surface_triangles),
+            np.asarray(problem.contact.surface_edges),
+            d_hat=1.0e-3,
+            capacity=16384,
+            band=band,
         )
-
-    def test_a_head_on_impact_is_cut_short_and_keeps_a_margin(self):
-        start = _quad([0.3, 0.3, 0.1], *_TRIANGLE)
-        end = _quad([0.3, 0.3, -0.5], *_TRIANGLE)
-        toi = self._toi(start, end, 0)
-        self.assertGreater(toi, 0.0)
-        self.assertLess(toi, 1.0)
-
-        initial = _pair_gap(start, 0)
-        landed = _pair_gap(start + toi * (end - start), 0)
-        # Not merely "did not intersect": it stopped with room to spare, which is what keeps
-        # the barrier's argument away from zero on the next step.
-        self.assertGreaterEqual(landed, (1.0 - 0.9) * initial - 1e-12)
-
-    def test_the_whole_certified_interval_is_safe_not_just_its_endpoint(self):
-        """A segment certificate. Checking only where the step lands would miss a dip."""
-        start = _quad([0.3, 0.3, 0.1], *_TRIANGLE)
-        end = _quad([0.3, 0.3, -0.5], *_TRIANGLE)
-        toi = self._toi(start, end, 0)
-        for t in np.linspace(0.0, toi, 200):
-            self.assertGreater(_pair_gap(start + t * (end - start), 0), 0.0)
-
-    def test_the_time_of_impact_never_over_estimates(self):
-        start = _quad([0.3, 0.3, 0.1], *_TRIANGLE)
-        end = _quad([0.3, 0.3, -0.5], *_TRIANGLE)
-        toi = self._toi(start, end, 0)
-        # Dense sampling for the first crossing: ACCD must stop strictly before it.
-        crossing = 1.0
-        for t in np.linspace(0.0, 1.0, 20001):
-            if _pair_gap(start + t * (end - start), 0) <= 0.0:
-                crossing = t
-                break
-        self.assertLessEqual(toi, crossing + 1e-9)
-
-    def test_a_shared_translation_does_not_throttle_the_step(self):
-        """The mean-subtraction gate.
-
-        Two primitives flying through space together are not approaching each other at all.
-        Without subtracting the mean displacement, the Lipschitz bound is dominated by the
-        shared velocity and the time of impact collapses -- a silent, catastrophic throttle
-        that presents only as "the solver got slow".
-        """
-        start = _quad([0.3, 0.3, 0.1], *_TRIANGLE)
-        end = _quad([0.3, 0.3, -0.5], *_TRIANGLE)
-        toi = self._toi(start, end, 0)
-
-        drift = _quad(*([[1.0e3, 0.0, 0.0]] * 4))
-        drifted = self._toi(start + drift, end + drift, 0)
-        self.assertAlmostEqual(toi, drifted, places=12)
-
-    def test_a_rigidly_translating_pair_is_never_throttled(self):
-        start = _quad([0.3, 0.3, 0.01], *_TRIANGLE)
-        end = start + _quad(*([[9.0, 9.0, 9.0]] * 4))
-        self.assertEqual(self._toi(start, end, 0), 1.0)
-
-    def test_edge_edge_uses_the_edge_edge_lipschitz_bound(self):
-        """Two edges whose endpoints fly apart in opposite directions.
-
-        The point-triangle bound (`|p0| + max of the other three`) *under-estimates* the rate
-        at which two edges can close, and an under-estimated Lipschitz constant permits too
-        long a step. It is unsound, and it looks entirely reasonable.
-        """
-        start = _quad(
-            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, -0.5, 0.01], [0.5, 0.5, 0.01]
+        surface = np.unique(np.asarray(problem.contact.surface_triangles))
+        bounds = build_vertex_bounds(
+            pair_vertices, pair_valid, distances, positions.shape[0], band, surface
         )
-        end = _quad(
-            [0.0, 0.0, 0.5],
-            [1.0, 0.0, -0.5],
-            [0.5, -0.5, -0.49],
-            [0.5, 0.5, 0.51],
-        )
-        toi = self._toi(start, end, 1)
-        for t in np.linspace(0.0, toi, 300):
-            self.assertGreater(_pair_gap(start + t * (end - start), 1), 0.0)
+        return positions, pair_vertices, pair_type, pair_valid, distances, bounds, band
 
-    def test_a_safe_advance_that_overshoots_the_segment_certifies_all_of_it(self):
-        """Regression: a distant pair must return 1.0, not 0.0.
-
-        When the conservative advance runs past t = 1 the probe lands outside the motion that
-        actually happens -- the primitive has sailed *through* the obstacle and out the far
-        side -- so its gap reads small again and can trip the convergence test. Returning the
-        last accepted time then yields 0 for a pair that was never in any danger, and a single
-        such pair drags the whole mesh's global minimum to zero and freezes the solve.
-        """
-        start = _quad([0.3, 0.3, 0.30], *_TRIANGLE)
-        end = _quad([0.3, 0.3, 0.255], *_TRIANGLE)
-        self.assertEqual(self._toi(start, end, 0), 1.0)
-
-    def test_separating_motion_is_unrestricted(self):
-        start = _quad([0.3, 0.3, 0.1], *_TRIANGLE)
-        end = _quad([0.3, 0.3, 5.0], *_TRIANGLE)
-        self.assertEqual(self._toi(start, end, 0), 1.0)
-
-    def test_a_padded_pair_is_finite_and_unrestricted(self):
-        """A padded slot is four coincident points: zero gap, zero motion, every division 0/0.
-
-        It must produce 1.0 *without producing a NaN anywhere*, not merely mask one away --
-        a single NaN here would poison the global minimum and freeze the entire mesh.
-        """
-        padded = jnp.zeros((4, 3))
-        for pair_type in (0, 1):
-            for end in (padded, padded + 1.0):
-                toi = self._toi(padded, end, pair_type, valid=FALSE_)
-                self.assertTrue(np.isfinite(toi))
-                self.assertEqual(toi, 1.0)
-
-    def test_an_already_touching_pair_freezes_rather_than_pretending(self):
-        start = _quad([0.3, 0.3, 0.0], *_TRIANGLE)
-        end = _quad([0.3, 0.3, -1.0], *_TRIANGLE)
-        toi = self._toi(start, end, 0)
-        self.assertTrue(np.isfinite(toi))
-        self.assertEqual(toi, 0.0)
-
-    def test_fuzz_is_finite_in_range_and_never_certifies_an_intersection(self):
-        rng = np.random.default_rng(7)
-        batched = jax.jit(
-            jax.vmap(pair_time_of_impact, in_axes=(0, 0, 0, 0, None))
-        )
-        squared = jax.jit(jax.vmap(pair_distance_sq))
-
-        for pair_type in (0, 1):
-            with self.subTest(pair_type=pair_type):
-                count = 1000
-                start = jnp.asarray(rng.normal(scale=0.5, size=(count, 4, 3)))
-                end = start + jnp.asarray(rng.normal(size=(count, 4, 3)))
-                types = jnp.full((count,), pair_type, dtype=jnp.int32)
-                valid = jnp.asarray(rng.random(count) > 0.2)
-
-                toi = batched(start, end, types, valid, SLACK)
-                self.assertTrue(bool(jnp.isfinite(toi).all()))
-                self.assertTrue(bool(((toi >= 0.0) & (toi <= 1.0)).all()))
-
-                initial = jnp.sqrt(jnp.maximum(squared(start, types), 0.0))
-                live = np.asarray(valid & (initial > 1e-6))
-                # Nothing that started apart may be certified into an intersection...
-                for fraction in np.linspace(0.0, 1.0, 25):
-                    probe = start + (fraction * toi)[:, None, None] * (end - start)
-                    gap = np.asarray(
-                        jnp.sqrt(jnp.maximum(squared(probe, types), 0.0))
-                    )
-                    self.assertEqual(int(((gap <= 0.0) & live).sum()), 0)
-                # ...and nothing that started apart may be spuriously frozen, either.
-                self.assertEqual(
-                    int(((np.asarray(toi) < 1e-12) & live).sum()), 0
+    def test_bounds_are_gamma_p_of_the_nearest_pair_distance(self):
+        (
+            positions,
+            pair_vertices,
+            _,
+            pair_valid,
+            distances,
+            bounds,
+            band,
+        ) = self._detected()
+        self.assertGreater(int(pair_valid.sum()), 0)
+        expected = np.full(positions.shape[0], band)
+        for pair, distance in zip(
+            pair_vertices[pair_valid], distances[pair_valid]
+        ):
+            for vertex in pair:
+                expected[vertex] = min(expected[vertex], distance)
+        for pair in pair_vertices[pair_valid]:
+            for vertex in pair:
+                self.assertAlmostEqual(
+                    float(bounds[vertex]), GAMMA_P * expected[vertex], places=12
                 )
 
+    def test_a_vertex_with_no_nearby_pair_gets_the_band_bound(self):
+        # n=3: the blocks' top-layer vertices sit a whole block-height from the
+        # interface, participate in no candidate pair, and must keep the roomy
+        # band-capped bound. (At n=2 every vertex belongs to a full-height vertical
+        # edge whose lower endpoint is near the interface, so no vertex is "far".)
+        positions, pair_vertices, _, pair_valid, _, bounds, band = self._detected(n=3)
+        involved = set(np.asarray(pair_vertices[pair_valid]).ravel())
+        # The blocks' outer corners are surface vertices far from the interface.
+        far_surface = [
+            v
+            for v in range(positions.shape[0])
+            if v not in involved and bounds[v] < UNBOUNDED / 2
+        ]
+        self.assertGreater(len(far_surface), 0)
+        for vertex in far_surface:
+            self.assertAlmostEqual(float(bounds[vertex]), GAMMA_P * band, places=12)
 
-class DisplacementClampTests(unittest.TestCase):
-    """The clause that makes the detection band trustworthy."""
+    def test_interior_vertices_are_unbounded(self):
+        """Only surface primitives can intersect; a bounded interior would throttle the
+        bulk of a fine mesh for nothing. (The two-block fixture has no interior vertex,
+        so this uses a 3x3x3 block whose centre vertex is interior.)"""
+        positions, tets = _block()
+        triangles, edges, surface = build_surface_topology(tets)
+        interior = sorted(
+            set(range(positions.shape[0])) - set(np.asarray(surface).tolist())
+        )
+        self.assertGreater(len(interior), 0)
+        bounds = build_vertex_bounds(
+            np.zeros((4, 4), dtype=np.int32),
+            np.zeros((4,), dtype=bool),
+            np.full((4,), np.inf),
+            positions.shape[0],
+            band=1.0e-2,
+            surface_vertices=np.asarray(surface),
+        )
+        for vertex in interior:
+            self.assertGreaterEqual(float(bounds[vertex]), UNBOUNDED)
 
-    def test_the_band_always_dominates_twice_the_allowed_displacement(self):
-        """`band >= d_hat + 2 * max_displacement` -- the inequality the guarantee rests on."""
+    def test_moving_every_vertex_by_its_bound_cannot_close_any_pair(self):
+        """The composition property itself, adversarially fuzzed.
+
+        Every vertex moves its full bound -- worst case simultaneously, including both
+        sides of every pair -- in random directions, plus a targeted pass where each
+        pair's endpoints move straight at each other. No detected pair may reach zero
+        distance, and (band cap) no undetected pair may enter contact either; the
+        latter is implied by construction, so the assertion checks the detected set.
+        """
+        (
+            positions,
+            pair_vertices,
+            pair_type,
+            pair_valid,
+            _,
+            bounds,
+            _,
+        ) = self._detected()
+        squared = jax.jit(jax.vmap(pair_distance_sq))
+        live = np.asarray(pair_valid)
+        clipped = np.minimum(bounds, 1.0e6)  # displacement, not certificate, for interior
+        rng = np.random.default_rng(3)
+
+        def min_gap(displaced):
+            quads = jnp.asarray(displaced)[jnp.asarray(pair_vertices)]
+            gaps = np.sqrt(
+                np.maximum(np.asarray(squared(quads, jnp.asarray(pair_type))), 0.0)
+            )
+            return float(gaps[live].min())
+
+        for trial in range(20):
+            directions = rng.normal(size=positions.shape)
+            directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+            self.assertGreater(
+                min_gap(positions + clipped[:, None] * directions), 0.0
+            )
+
+        # Targeted, the composition argument's exact worst case: every one of a pair's
+        # four vertices spends its full bound along the direction that shrinks THAT
+        # pair's distance fastest -- the rows of the gap gradient (w_k * n, the
+        # barycentric weights times the contact normal). Each side's weights sum to
+        # one in magnitude, so the pair closes by up to (bound_a + bound_b) =
+        # 2 * GAMMA_P * d: at GAMMA_P = 0.5 the gap lands on exactly zero and this
+        # assertion fails. This is the test that pins GAMMA_P strictly below one half;
+        # an earlier version moved only one side and stayed green up to 0.8.
+        gap_of = lambda quad, kind: jnp.sqrt(pair_distance_sq(quad, kind) + 1.0e-30)
+        gap_gradient = jax.jit(jax.vmap(jax.grad(gap_of, argnums=0)))
+        live_pairs = jnp.asarray(pair_vertices[live])
+        live_types = jnp.asarray(np.asarray(pair_type)[live])
+        quads = jnp.asarray(positions)[live_pairs]
+        gradients = np.asarray(gap_gradient(quads, live_types))
+        norms = np.linalg.norm(gradients, axis=2, keepdims=True)
+        directions = np.where(norms > 1e-9, -gradients / np.maximum(norms, 1e-30), 0.0)
+        budgets = clipped[np.asarray(live_pairs)][:, :, None]
+        displaced_quads = np.asarray(quads) + budgets * directions
+        closed = np.sqrt(
+            np.maximum(
+                np.asarray(squared(jnp.asarray(displaced_quads), live_types)), 0.0
+            )
+        )
+        self.assertGreater(float(closed.min()), 0.0)
+
+    def test_gamma_p_is_strictly_below_one_half(self):
+        """The factor that makes two moving endpoints compose. At exactly 0.5 the
+        adversarial fuzz above closes a pair to zero; this pins the constant's contract
+        directly so the failure mode is named even if the fuzz is ever weakened."""
+        self.assertLess(GAMMA_P, 0.5)
+
+    def test_the_band_covers_the_prescribed_motion(self):
+        """A prescribed vertex cannot be truncated, so its far-field bound
+        (GAMMA_P * band) must exceed the whole-step prescribed displacement -- otherwise
+        the audit raises on motion the band was supposed to plan for."""
         for d_hat in (1e-4, 1e-3, 1e-2):
-            for predicted in (0.0, 1e-3, 0.05, 1.0, 40.0):
-                with self.subTest(d_hat=d_hat, predicted=predicted):
-                    band, allowed = derive_detection_band(d_hat, predicted)
-                    self.assertGreater(band - 2.0 * allowed, d_hat)
+            for prescribed in (0.0, 1e-3, 0.05, 1.0, 40.0):
+                with self.subTest(d_hat=d_hat, prescribed=prescribed):
+                    band = derive_bounds_band(d_hat, 0.0, prescribed)
+                    self.assertGreater(GAMMA_P * band, prescribed)
+
+    def test_redetection_threshold_floors_at_one(self):
+        self.assertEqual(redetection_threshold(5), 1)
+        self.assertEqual(redetection_threshold(10000), 100)
+
+
+class BoundTruncationTests(unittest.TestCase):
+    """The device-side kernel that enforces the bounds, per vertex, per iteration."""
+
+    def _contact(self, bounds, anchor, ccd_enabled=True):
+        problem, state, _ = _two_blocks()
+        contact_state = dataclasses.replace(
+            problem.contact.state,
+            vertex_bounds=jnp.zeros(
+                (state.position.shape[0],), dtype=jnp.float64
+            ) + jnp.asarray(bounds),
+            bound_anchor=jnp.asarray(anchor),
+        )
+        ccd = dataclasses.replace(
+            problem.contact.ccd, enabled=jnp.asarray(ccd_enabled)
+        )
+        return dataclasses.replace(
+            problem.contact, state=contact_state, ccd=ccd
+        ), state
 
     def test_a_step_that_would_leave_the_ball_is_cut_back(self):
-        start = jnp.zeros((3, 3))
-        end = jnp.asarray([[10.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
-        free = jnp.asarray([True, True, True])
-        toi = float(
-            displacement_clamp_time_of_impact(
-                start, start, end, free, jnp.asarray(1.0)
-            )
+        problem, state, _ = _two_blocks()
+        anchor = state.position
+        contact, _ = self._contact(1.0, anchor)
+        proposed = state.position.at[0, 0].add(10.0)
+        free = jnp.ones((state.position.shape[0],), dtype=bool)
+        truncated, exceeded = truncate_to_bounds(
+            contact, anchor, state.position, proposed, free
         )
-        self.assertAlmostEqual(toi, 0.1, places=9)
-        moved = np.asarray(start + toi * (end - start))
-        self.assertLessEqual(np.linalg.norm(moved, axis=-1).max(), 1.0 + 1e-9)
+        moved = np.linalg.norm(
+            np.asarray(truncated) - np.asarray(anchor), axis=-1
+        )
+        self.assertLessEqual(moved.max(), 1.0 + 1e-9)
+        self.assertAlmostEqual(moved[0], 1.0, places=9)
+        self.assertEqual(int(exceeded), 1)
 
-    def test_a_step_inside_the_ball_is_unrestricted(self):
-        start = jnp.zeros((2, 3))
-        end = jnp.asarray([[0.1, 0.0, 0.0], [0.0, 0.2, 0.0]])
-        free = jnp.asarray([True, True])
-        toi = float(
-            displacement_clamp_time_of_impact(
-                start, start, end, free, jnp.asarray(1.0)
-            )
+    def test_displacement_is_cumulative_from_the_anchor(self):
+        """K iterations must not buy K times the certified distance: a vertex already
+        at 80% of its bound has only 20% left, wherever this iteration starts."""
+        problem, state, _ = _two_blocks()
+        anchor = state.position
+        contact, _ = self._contact(1.0, anchor)
+        part_way = state.position.at[0, 0].add(0.8)
+        proposed = part_way.at[0, 0].add(10.0)
+        free = jnp.ones((state.position.shape[0],), dtype=bool)
+        truncated, _ = truncate_to_bounds(contact, anchor, part_way, proposed, free)
+        self.assertLessEqual(
+            float(jnp.linalg.norm(truncated[0] - anchor[0])), 1.0 + 1e-9
         )
-        self.assertEqual(toi, 1.0)
 
-    def test_a_constrained_vertex_does_not_bind_the_clamp(self):
-        """Dirichlet rows are rewritten *after* the filter, so clamping them would freeze the
-        mesh for nothing. The host audit covers them instead."""
-        start = jnp.zeros((2, 3))
-        end = jnp.asarray([[99.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
-        free = jnp.asarray([False, True])
-        toi = float(
-            displacement_clamp_time_of_impact(
-                start, start, end, free, jnp.asarray(1.0)
-            )
+    def test_a_step_inside_the_ball_is_untouched_and_uncounted(self):
+        problem, state, _ = _two_blocks()
+        anchor = state.position
+        contact, _ = self._contact(1.0, anchor)
+        proposed = state.position.at[0, 0].add(0.5)
+        free = jnp.ones((state.position.shape[0],), dtype=bool)
+        truncated, exceeded = truncate_to_bounds(
+            contact, anchor, state.position, proposed, free
         )
-        self.assertEqual(toi, 1.0)
+        np.testing.assert_allclose(np.asarray(truncated), np.asarray(proposed))
+        self.assertEqual(int(exceeded), 0)
+
+    def test_a_constrained_vertex_passes_through_untouched(self):
+        """Dirichlet rows are rewritten *after* the truncation, so clipping them would be
+        silently undone; the prescribed-bounds audit covers them instead."""
+        problem, state, _ = _two_blocks()
+        anchor = state.position
+        contact, _ = self._contact(1.0e-6, anchor)
+        proposed = state.position + 5.0
+        free = jnp.zeros((state.position.shape[0],), dtype=bool)
+        truncated, exceeded = truncate_to_bounds(
+            contact, anchor, state.position, proposed, free
+        )
+        np.testing.assert_allclose(np.asarray(truncated), np.asarray(proposed))
+        self.assertEqual(int(exceeded), 0)
+
+    def test_only_the_offending_vertex_is_truncated(self):
+        """The point of the whole change: one vertex out of budget must not scale
+        anyone else. The old sweep filter multiplied every displacement by one global
+        scalar; here the far vertex keeps 100% of its motion."""
+        problem, state, _ = _two_blocks()
+        anchor = state.position
+        contact, _ = self._contact(1.0e-3, anchor)
+        proposed = state.position.at[0, 0].add(1.0).at[1, 1].add(0.5e-3)
+        free = jnp.ones((state.position.shape[0],), dtype=bool)
+        truncated, exceeded = truncate_to_bounds(
+            contact, anchor, state.position, proposed, free
+        )
+        self.assertAlmostEqual(
+            float(jnp.linalg.norm(truncated[0] - anchor[0])), 1.0e-3, places=9
+        )
+        self.assertAlmostEqual(float(truncated[1, 1] - anchor[1, 1]), 0.5e-3, places=12)
+        self.assertEqual(int(exceeded), 1)
 
 
 class PairFrictionTests(unittest.TestCase):
@@ -1549,7 +1629,7 @@ class SelfCollisionDetectionTests(unittest.TestCase):
             with self.subTest(size=size):
                 positions, tets = _block(nx=size, ny=size, nz=size)
                 triangles, edges, _ = build_surface_topology(np.asarray(tets))
-                _, _, valid = detect_contact_pairs(
+                _, _, valid, _ = detect_contact_pairs(
                     np.asarray(positions),
                     np.asarray(triangles),
                     np.asarray(edges),
@@ -1707,6 +1787,256 @@ class SelfCollisionTunnellingTests(unittest.TestCase):
                 )
             )
             self.assertGreater(float(gaps[valid].min()), 0.0)
+
+
+class LocalThrottlingTests(unittest.TestCase):
+    """What replacing the global sweep filter actually buys, measured end to end."""
+
+    def test_far_vertices_are_not_throttled_by_a_near_contact(self):
+        """Two disconnected block pairs, both upper blocks descending at 1 unit/s: one
+        hovers a whisker above its lower block, the other has 30 units of clearance.
+        Under the old global filter the whole mesh was scaled by the near body's tiny
+        time of impact (~gap / step), so the far body would have moved microns; under
+        per-vertex bounds the far body must take essentially its full 5e-3 inertial step
+        while the near body's approach stays bound-limited below its gap.
+        """
+        spacing, gap, speed, dt = 0.25, 0.6e-3, -1.0, 0.005
+        lower_a, tets_a = _block(nx=2, ny=2, nz=2, z0=0.0)
+        upper_a, tets_b = _block(nx=2, ny=2, nz=2, z0=spacing + gap)
+        lower_b, tets_c = _block(nx=2, ny=2, nz=2, z0=0.0)
+        upper_b, tets_d = _block(nx=2, ny=2, nz=2, z0=spacing + 30.0)
+        far_offset = jnp.asarray([50.0, 0.0, 0.0])
+
+        counts = [len(lower_a), len(upper_a), len(lower_b), len(upper_b)]
+        offsets = np.cumsum([0] + counts)
+        positions = jnp.concatenate(
+            [
+                lower_a,
+                upper_a,
+                lower_b + far_offset,
+                upper_b + far_offset,
+            ]
+        )
+        tets = jnp.concatenate(
+            [
+                tets_a,
+                tets_b + offsets[1],
+                tets_c + offsets[2],
+                tets_d + offsets[3],
+            ]
+        )
+        free = np.ones(positions.shape[0])
+        free[: offsets[1]] = 0.0  # near-scene lower block fixed
+        free[offsets[2] : offsets[3]] = 0.0  # far-scene lower block fixed
+
+        problem = assemble_problem(
+            positions,
+            tets,
+            jnp.asarray(free),
+            dt=dt,
+            num_iterations=10,
+            mu=50.0,
+            lam=50.0,
+            density=1.0,
+            eps=1.0e-8,
+            external_acceleration=(0.0, 0.0, 0.0),
+            contact_d_hat=1.0e-3,
+            self_collision=True,
+            contact_capacity=16384,
+            contact_max_per_vertex=512,
+        )
+        velocity = np.zeros((positions.shape[0], 3))
+        velocity[offsets[1] : offsets[2], 2] = speed
+        velocity[offsets[3] : offsets[4], 2] = speed
+        state = SimulationState(
+            position=positions,
+            velocity=jnp.asarray(velocity),
+            time=jnp.asarray(0.0, dtype=positions.dtype),
+        )
+        next_state = vbd.step(problem, state)
+
+        moved = np.linalg.norm(
+            np.asarray(next_state.position) - np.asarray(state.position), axis=-1
+        )
+        # Approach is the certified quantity: net displacement can legitimately exceed
+        # the gap when the block compresses and rebounds within the step, but no vertex
+        # may *descend* through the interface.
+        descended = np.asarray(state.position)[:, 2] - np.asarray(
+            next_state.position
+        )[:, 2]
+        inertial_step = abs(speed) * dt  # 5e-3: what every descending vertex wants
+        far_free = moved[offsets[3] : offsets[4]]
+        # Only the near block's interface layer is bound-limited; its *top* layer keeps
+        # descending as the block compresses -- local throttling applies within a body,
+        # not just between bodies, so the certified quantity is the bottom face's
+        # approach.
+        near_bottom = (
+            np.abs(np.asarray(positions)[offsets[1] : offsets[2], 2] - (spacing + gap))
+            < 1e-12
+        )
+        near_descent = descended[offsets[1] : offsets[2]][near_bottom]
+        self.assertGreater(near_descent.size, 0)
+        # The far body takes its full inertial step (against solver tolerance, not
+        # against a throttle)...
+        self.assertGreater(far_free.min(), 0.95 * inertial_step)
+        # ...while the near interface's approach is bound-limited to less than its gap:
+        # the throttling is local, which is the entire point of the change.
+        self.assertLess(near_descent.max(), gap)
+        self.assertGreater(far_free.min(), 5.0 * near_descent.max())
+
+    def test_prescribed_motion_beyond_its_bound_raises(self):
+        """The truncation cannot bind a boundary condition, so the audit must: driving
+        the fixed block's prescription through the free one has to fail loudly, in the
+        naming-the-cause register, not silently void the certificate."""
+        from diff_vbd.model import DirichletSpec
+        from diff_vbd.setup.boundary_conditions import (
+            assemble_dirichlet_boundary_conditions,
+        )
+        from diff_vbd.setup.selector_io import SelectorVertexMembership
+
+        spacing, gap = 0.25, 0.6e-3
+        lower_p, lower_t = _block(nx=2, ny=2, nz=2, z0=0.0)
+        upper_p, upper_t = _block(nx=2, ny=2, nz=2, z0=spacing + gap)
+        n_lower = len(lower_p)
+        positions = jnp.concatenate([lower_p, upper_p])
+        tets = jnp.concatenate([lower_t, upper_t + n_lower])
+
+        mask = np.zeros(positions.shape[0], dtype=bool)
+        mask[:n_lower] = True
+        membership = SelectorVertexMembership(
+            selector_name="driven",
+            vertex_mask=jnp.asarray(mask),
+            vertex_indices=jnp.asarray(np.flatnonzero(mask), dtype=jnp.int32),
+        )
+        boundary = assemble_dirichlet_boundary_conditions(
+            positions,
+            [membership],
+            # 40 units/s straight up into the resting block: far beyond any bound.
+            [DirichletSpec("driven", "velocity", ("0.0", "0.0", "40.0"))],
+        )
+        problem = assemble_problem(
+            positions,
+            tets,
+            boundary,
+            dt=0.005,
+            num_iterations=10,
+            mu=50.0,
+            lam=50.0,
+            density=1.0,
+            eps=1.0e-8,
+            external_acceleration=(0.0, 0.0, 0.0),
+            contact_d_hat=1.0e-3,
+            self_collision=True,
+            contact_capacity=16384,
+            contact_max_per_vertex=512,
+        )
+        state = _initial(problem)
+        with self.assertRaisesRegex(ValueError, "conservative bound"):
+            for _ in range(5):
+                state = vbd.step(problem, state)
+
+    def test_prescribed_press_is_substepped_within_its_bounds(self):
+        """A scripted press whose whole-step travel exceeds the gap must still work.
+
+        The prescribed jump (0.6e-3 gap crossed in one step) cannot be truncated, so
+        applying it in one go would breach every interface bound and raise -- which is
+        exactly what an earlier revision of the bounds scheme did, regressing scripted
+        motion the old global filter handled. The prescription is now applied in
+        per-iteration increments with on-demand re-anchoring; this test drives the
+        press for several steps and requires (a) no raise, (b) the free block actually
+        pushed upward, and (c) every detected pair still strictly separated after
+        every step -- the capability and the certificate at once."""
+        from diff_vbd.model import DirichletSpec
+        from diff_vbd.setup.boundary_conditions import (
+            assemble_dirichlet_boundary_conditions,
+        )
+        from diff_vbd.setup.selector_io import SelectorVertexMembership
+
+        spacing, gap = 0.25, 0.6e-3
+        lower_p, lower_t = _block(nx=2, ny=2, nz=2, z0=0.0)
+        upper_p, upper_t = _block(nx=2, ny=2, nz=2, z0=spacing + gap)
+        n_lower = len(lower_p)
+        positions = jnp.concatenate([lower_p, upper_p])
+        tets = jnp.concatenate([lower_t, upper_t + n_lower])
+
+        mask = np.zeros(positions.shape[0], dtype=bool)
+        mask[:n_lower] = True
+        membership = SelectorVertexMembership(
+            selector_name="driven",
+            vertex_mask=jnp.asarray(mask),
+            vertex_indices=jnp.asarray(np.flatnonzero(mask), dtype=jnp.int32),
+        )
+        boundary = assemble_dirichlet_boundary_conditions(
+            positions,
+            [membership],
+            # 0.12 units/s: one 5 ms step travels 6e-4 -- the whole initial gap.
+            [DirichletSpec("driven", "velocity", ("0.0", "0.0", "0.12"))],
+        )
+        problem = assemble_problem(
+            positions,
+            tets,
+            boundary,
+            dt=0.005,
+            num_iterations=20,
+            mu=50.0,
+            lam=50.0,
+            density=1.0,
+            eps=1.0e-8,
+            external_acceleration=(0.0, 0.0, 0.0),
+            contact_d_hat=1.0e-3,
+            self_collision=True,
+            contact_capacity=16384,
+            contact_max_per_vertex=512,
+        )
+        state = _initial(problem)
+        squared = jax.jit(jax.vmap(pair_distance_sq))
+        for _ in range(3):
+            state = vbd.step(problem, state)
+            self.assertTrue(bool(jnp.all(jnp.isfinite(state.position))))
+            probe = vbd.redetect_contacts(problem, state)
+            contact_state = probe.contact.state
+            live = np.asarray(contact_state.pair_valid)
+            self.assertGreater(int(live.sum()), 0)
+            gaps = np.sqrt(
+                np.maximum(
+                    np.asarray(
+                        squared(
+                            state.position[contact_state.pair_vertices],
+                            contact_state.pair_type,
+                        )
+                    ),
+                    0.0,
+                )
+            )
+            self.assertGreater(float(gaps[live].min()), 0.0)
+        # The press transmitted: the free block was pushed up by a meaningful fraction
+        # of the prescribed travel (3 steps x 6e-4), not left behind by a frozen sweep.
+        lifted = float(
+            jnp.min(state.position[n_lower:, 2]) - (spacing + gap)
+        )
+        self.assertGreater(lifted, 0.5e-3)
+
+    def test_consuming_bounds_triggers_redetection(self):
+        """Bounds are refreshed by detection, and detection re-runs only when enough
+        vertices have consumed theirs (OGC's gamma_e rule). A block falling fast onto
+        another must re-detect mid-step; a resting one must not re-detect at all."""
+        from unittest import mock
+
+        problem, state, _ = _two_blocks(
+            gap=5.0e-3, velocity=(0.0, 0.0, -5.0), external_acceleration=(0.0, 0.0, 0.0)
+        )
+        with mock.patch.object(
+            vbd, "_redetect_at_positions", wraps=vbd._redetect_at_positions
+        ) as spy:
+            vbd.step(problem, state)
+            self.assertGreater(spy.call_count, 0)
+
+        problem, state, _ = _two_blocks(gap=5.0e-3)
+        with mock.patch.object(
+            vbd, "_redetect_at_positions", wraps=vbd._redetect_at_positions
+        ) as spy:
+            vbd.step(problem, state)
+            self.assertEqual(spy.call_count, 0)
 
 
 class CollidingMaskTests(unittest.TestCase):

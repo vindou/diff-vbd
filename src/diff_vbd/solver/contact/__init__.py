@@ -1,12 +1,13 @@
-"""Contact modelling: IPC barrier, distances, colliders, CCD, friction.
+"""Contact modelling: activation energies, distances, colliders, bounds, friction.
 
 The package is split along one line, and the split is load bearing:
 
 * The **combinatorial layer** (detection, active set, distance-type classification,
-  time-of-impact) is integer-valued, runs on the host, and carries no gradient. It emits
-  frozen fixed-shape buffers.
-* The **smooth layer** (distances given a frozen classification, barrier, friction) is a
-  differentiable function of vertex positions and is the only part ever differentiated.
+  conservative bounds, time-of-impact) is integer- or bound-valued, runs on the host or
+  under ``stop_gradient``, and carries no gradient. It emits frozen fixed-shape buffers.
+* The **smooth layer** (distances given a frozen classification, activation energies,
+  friction) is a differentiable function of vertex positions and is the only part ever
+  differentiated.
 
 Keeping the line clean is what makes the whole thing jit-able (static shapes), general
 (one force-element abstraction) and differentiable at once.
@@ -20,14 +21,13 @@ from diff_vbd.solver.contact.barrier import (
     penalty_energy,
     two_stage_energy,
 )
-from diff_vbd.solver.contact.ccd import (
-    derive_detection_band,
-    displacement_clamp_time_of_impact,
-    filter_sweep,
-    pair_time_of_impact,
-    sweep_time_of_impact,
-    vertex_time_of_impact,
+from diff_vbd.solver.contact.bounds import (
+    build_vertex_bounds,
+    derive_bounds_band,
+    redetection_threshold,
+    truncate_to_bounds,
 )
+from diff_vbd.solver.contact.ccd import vertex_time_of_impact
 from diff_vbd.solver.contact.colliders import (
     COLLIDER_KINDS,
     collider_normal,
@@ -80,6 +80,7 @@ __all__ = [
     "barrier_energy",
     "barrier_stiffness",
     "build_contact_incidence",
+    "build_vertex_bounds",
     "classify_edge_edge",
     "classify_point_triangle",
     "collider_contact_energy",
@@ -89,29 +90,26 @@ __all__ = [
     "colliding_vertex_mask",
     "contact_normal_force",
     "contact_potential",
-    "derive_detection_band",
+    "derive_bounds_band",
     "detect_contact_pairs",
-    "displacement_clamp_time_of_impact",
     "distance_from_squared",
     "edge_edge_distance_sq",
     "edge_edge_mollifier",
     "edge_edge_mollifier_threshold",
-    "filter_sweep",
     "incident_pair_energy",
     "incident_pair_min_gap",
     "pair_contact_energy",
     "pair_distance_sq",
     "pair_friction_energy",
     "pair_gap_and_mollifier",
-    "pair_time_of_impact",
     "penalty_energy",
     "point_edge_distance_sq",
     "point_point_distance_sq",
     "point_triangle_distance_sq",
+    "redetection_threshold",
     "smooth_friction_f0",
     "smooth_friction_f1",
-    "sweep_time_of_impact",
     "tangent_basis",
+    "truncate_to_bounds",
     "two_stage_energy",
-    "vertex_time_of_impact",
 ]

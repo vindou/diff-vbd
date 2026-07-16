@@ -177,9 +177,16 @@ class ContactState:
     the same shape is a jit cache hit; a changing capacity is a full recompile of the solver
     every step, so the capacity is chosen once and overflow is an error.
 
-    All of it is integer- or mask-valued and none of it is ever differentiated. Capacity is
-    read from ``.shape``, never stored as an int field -- an int field on a pytree_dataclass
-    becomes a *tracer* and cannot size an array.
+    None of it is ever differentiated. Capacity is read from ``.shape``, never stored as
+    an int field -- an int field on a pytree_dataclass becomes a *tracer* and cannot size
+    an array.
+
+    ``vertex_bounds`` and ``bound_anchor`` are the per-vertex intersection-free
+    certificate (Wu et al. 2020; see ``contact.bounds``): from the intersection-free
+    ``bound_anchor`` configuration recorded at detection, every vertex may move at most
+    its bound before detection must run again. They live here rather than in
+    ``CcdParams`` because they share the pair set's lifecycle exactly: stale bounds
+    against a fresh anchor (or vice versa) would certify nothing.
     """
 
     pair_vertices: jnp.ndarray  # (C, 4) int32; vertex-triangle uses [v, t0, t1, t2]
@@ -187,21 +194,22 @@ class ContactState:
     pair_valid: jnp.ndarray  # (C,) bool
     incident_contacts: jnp.ndarray  # (N, K) int32, pair indices touching each vertex
     incident_contact_mask: jnp.ndarray  # (N, K) bool
+    vertex_bounds: jnp.ndarray  # (N,) conservative displacement bounds b_v
+    bound_anchor: jnp.ndarray  # (N, 3) positions at the last detection
 
 
 @pytree_dataclass
 class CcdParams:
-    """The parameters of the mesh-mesh intersection-free guarantee.
+    """Parameters of the contact stepping safeguards.
 
-    ``max_displacement`` and ``detection_band`` are **refreshed every step** (they depend on
-    how fast the mesh is currently moving) and they are a matched pair: the band is only large
-    enough to make the pair set complete *because* the clamp stops any vertex leaving it. They
-    are derived together, in one place, so they cannot drift apart -- and they live here, as
-    array leaves, so rebuilding them each step is a jit cache hit rather than a recompile.
+    ``detection_band`` is refreshed at every detection from how fast the mesh is moving;
+    under the conservative-bound scheme it is a performance parameter (roomier bounds,
+    rarer re-detections), never a soundness one -- see ``contact.bounds``. ``slack`` is
+    the fraction of a gap one step may consume, used by the per-vertex collider filters
+    and the local Newton-step safeguard.
     """
 
     slack: jnp.ndarray  # fraction of the gap a step may consume, in (0, 1)
-    max_displacement: jnp.ndarray  # Δmax: how far a vertex may stray from the step start
     detection_band: jnp.ndarray  # the radius the pair set was built with
     enabled: jnp.ndarray  # bool: the mesh-mesh guarantee (colliders are always filtered)
 
