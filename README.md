@@ -186,6 +186,33 @@ increase its local objective. Without it the search is forced to return an objec
 step for such vertices, which pumps energy into the mesh and makes the solve diverge as
 `num_iterations` grows. Set `alphas: [...]` instead to pin the grid explicitly.
 
+### Energy API
+
+The solver never forms a global energy — VBD's premise is a 3×3 solve per vertex against a
+frozen block — but the energies it descends are also stated once, whole-mesh, in
+`solver/potential.py`:
+
+```python
+import diff_vbd as dv
+
+E = dv.potential_energy(problem, positions, previous_positions)          # elastic + contact
+G = dv.variational_energy(problem, positions, inertial_target, previous_positions)
+```
+
+`elastic_potential` and `inertia_potential` are the individual terms; `variational_energy`
+is G(x), the implicit-Euler objective a VBD sweep decreases. One energy definition, two
+consumers: the local vertex objective and this global view share the same kernels
+(`tet_energy`, the contact energies), so the forward solve and a future tangent-stiffness
+or adjoint path cannot silently disagree about what the energy *is*. The local objective
+sums the elements *incident to* a vertex, so it counts each tet (and each contact pair)
+four times; the tests pin that factor exactly rather than assuming it.
+
+Two limits worth stating: gradients of these potentials do not differentiate through
+contact *detection* (the active set and classifications are frozen inputs, refreshed by
+`redetect_contacts`), and monotone descent of G is only guaranteed in the regime the VBD
+paper's argument covers — line search on, Chebyshev acceleration off, no contact filter
+rescaling the sweep.
+
 ## Testing
 
 ```bash

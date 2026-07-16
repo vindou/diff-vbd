@@ -7,7 +7,11 @@ from diff_vbd.setup.boundary_conditions import (
     evaluate_dirichlet_targets,
 )
 from diff_vbd.setup.mesh_io import parse_gmsh22_binary_tets
-from diff_vbd.setup.problem_builder import assemble_problem, initial_state
+from diff_vbd.setup.problem_builder import (
+    assemble_problem,
+    empty_contact_state,
+    initial_state,
+)
 from diff_vbd.setup.selector_io import (
     SelectorClassificationOptions,
     SelectorClassificationStats,
@@ -20,6 +24,7 @@ from diff_vbd.setup.selector_io import (
 from diff_vbd.setup.topology import (
     build_incidence,
     build_lumped_masses,
+    build_surface_topology,
     build_vertex_adjacency,
     build_vertex_coloring,
 )
@@ -31,9 +36,11 @@ __all__ = [
     "build_incidence",
     "build_fixed_boundary_conditions",
     "build_lumped_masses",
+    "build_surface_topology",
     "build_vertex_adjacency",
     "build_vertex_coloring",
     "classify_selector_vertices",
+    "empty_contact_state",
     "evaluate_dirichlet_targets",
     "initial_state",
     "parse_binary_stl_aabb",

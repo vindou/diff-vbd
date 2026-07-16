@@ -27,7 +27,14 @@ from diff_vbd.setup.boundary_conditions import (
     assemble_dirichlet_boundary_conditions,
     evaluate_dirichlet_targets,
 )
-from diff_vbd.solver import simulate, step
+from diff_vbd.solver import (
+    elastic_potential,
+    inertia_potential,
+    potential_energy,
+    simulate,
+    step,
+    variational_energy,
+)
 
 __all__ = [
     "BoundaryConditions",
@@ -46,13 +53,17 @@ __all__ = [
     "assemble_dirichlet_boundary_conditions",
     "build_export_metadata",
     "build_cantilever_problem",
+    "elastic_potential",
     "evaluate_dirichlet_targets",
     "export_simulation_npz",
     "extract_surface_mesh",
+    "inertia_potential",
     "initial_state",
     "load_config",
     "load_problem_from_yaml",
+    "potential_energy",
     "simulate",
     "step",
     "surface_trajectory_from_history",
+    "variational_energy",
 ]
