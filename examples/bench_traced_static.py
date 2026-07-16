@@ -117,6 +117,47 @@ def main():
                   f"(expected ~tol/lambda_min for elements stopping at different "
                   f"residuals below tol; see test_static_traced.py)")
 
+    # ---- stall-free batch: isolates the batching economics from the pocket drag ----
+    # The random draw above hits zigzag stall pockets (FINDINGS.md): one lane running
+    # to max_iterations drags the whole batch through that many masked passes, so the
+    # per-solve number above conflates masking overhead with stall drag. This batch is
+    # the gate tests' 15 pairs verified to converge on both drivers in 10-14 iterations.
+    from test_static_traced import _BATCH_PAIRS, _center_at
+
+    mus = jnp.asarray([mu for mu, _ in _BATCH_PAIRS])
+    centers = jnp.asarray(np.stack([_center_at(dz) for _, dz in _BATCH_PAIRS]))
+    batch = StaticParams(mu=mus, collider_center=centers)
+    batch_size = len(_BATCH_PAIRS)
+
+    host_best = np.inf
+    for _ in range(_REPEATS):
+        t0 = time.perf_counter()
+        for b in range(batch_size):
+            solve_static_equilibrium(
+                apply_static_params(
+                    template,
+                    StaticParams(mu=mus[b], collider_center=centers[b]),
+                ),
+                tol=_TOL,
+                initial_position=initial,
+                max_iterations=_MAX_ITERATIONS,
+            )
+        host_best = min(host_best, time.perf_counter() - t0)
+
+    solve_batch = jax.jit(jax.vmap(solve_one_traced))
+    batched = solve_batch(batch)
+    batched.position.block_until_ready()
+    traced_best = np.inf
+    for _ in range(_REPEATS):
+        t0 = time.perf_counter()
+        batched = solve_batch(batch)
+        batched.position.block_until_ready()
+        traced_best = min(traced_best, time.perf_counter() - t0)
+    converged = int(np.sum(np.asarray(batched.converged)))
+    print(f"\nstall-free pinned batch (B={batch_size}, all lanes 10-14 iterations): "
+          f"host {host_best:.3f}s, traced {traced_best:.3f}s, "
+          f"speedup {host_best / traced_best:.2f}x, converged {converged}/{batch_size}")
+
 
 if __name__ == "__main__":
     main()

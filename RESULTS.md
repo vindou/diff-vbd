@@ -170,3 +170,101 @@ development machine's CPU. The Hertz numbers above were re-captured on the final
 after the colouring fix and are identical to the digits shown (the static-settle
 protocol does not depend on the sweep order). The first full-suite run is what caught
 the colouring regression (FINDINGS.md) — the suite earned its keep on its own branch.
+
+## traced-static — the traced solve and adjoint (branch feature/traced-static)
+
+The branch adds a `lax.while_loop` sibling of the host-side static solve so a batch of
+independent solves can run under `jax.vmap` — the host driver's Python `while` cannot be
+batched, which had pinned a Fisher-information design loop at batch 4. Same kernels,
+same acceptance rules; only the driver moved, and the host path is untouched
+byte-for-byte. Gate scene throughout: the M4 seated fixture (3x3x3 slab, clamped base,
+sphere at 0.02 indentation, barrier active).
+
+Agreement (same problem, both drivers, gate <= 1e-10 relative on positions):
+
+| fixture | solve tol | host iters/residual | traced iters/residual | position rel diff |
+|---|---|---|---|---|
+| seated contact (min gap 6.7e-4 < d_hat 1e-3, asserted) | 1e-11 | 9 / 3.9e-12 | 11 / 2.0e-12 | **9.6e-14** |
+| gravity-only slab, no colliders | 1e-10 | 8 / 1.2e-11 | 8 / 1.2e-11 | **7.1e-14** |
+
+The iteration counts differ (9 vs 11) while the answers agree to 1e-13: an eager Python
+replica of the traced body reproduces the host loop decision-for-decision, so the
+difference is compilation-context numerics (CG's threshold stop crossing an ulp
+boundary), not semantics — the zigzag-pocket finding in FINDINGS.md. The agreement
+fixtures solve to 1e-11/1e-10 rather than 1e-9 because two correct drivers may stop
+anywhere below tol, which alone separates positions by ~tol/lambda_min ≈ 5e-10 at
+tol=1e-9 — larger than the gate with both answers right (DECISIONS.md).
+
+Batching (the gate the branch exists for): `vmap` over 15 heterogeneous
+(mu, collider-height) StaticParams — 10–14 Newton iterations across lanes, so
+early-converging lanes idle masked while others run — matches 15 sequential host solves
+elementwise with **worst relative difference 5.4e-13** (tol 1e-11), every lane
+converged, every lane's gap inside the barrier band.
+
+Adjoint under vmap, per-sample `jax.vmap(jax.grad(...))` against central differences
+through the traced solve (float64, tol 1e-10, step sizes as in the M4 gates, barrier
+active, gate 1e-4 relative):
+
+| parameter | sample values | relative error |
+|---|---|---|
+| mu | 50, 65 | 3.9e-6, 7.9e-6 |
+| collider radius | 1.0, 0.995 | 3.3e-5, 5.0e-6 |
+| rest positions (directional) | s = 0.004, 0.005 | 3.9e-6, 4.3e-6 |
+
+The refusal, surviving vmap: a mixed batch (element 0 converges in ~11 iterations;
+element 1 = sphere lowered 5mm, so the shared start penetrates and the solve zigzags,
+genuinely unconverged at max_iterations=25) gives `converged=[True, False]`, an
+**all-NaN gradient for element 1 only**, and a finite element-0 gradient equal to its
+solo-run gradient within 4e-5 — the reproducibility bound set by `_adjoint_cg`'s 1e-5
+CG tolerance across two compilations, not poison leakage. `assert_converged` raises
+with the failing elements named; an all-converged batch passes silently; a single
+unconverged solve (max_iterations=1) poisons its scalar gradient.
+
+Transcription (added after adversarial review, see FINDINGS.md): the module-level step
+function driven eagerly pass-by-pass against a line-for-line host-loop replica agrees
+**bitwise, every pass**, on four scenarios — the smooth path, the zigzag's timid
+accepts (shift raised on accept), two forced full rejections walking the damping ladder
+(0 → 1e-4 → 1e-3, no Newton iteration counted), and a NaN direction from CG (retried
+under a raised shift exactly like the host, not misclassified as stagnation — the
+review's one major catch).
+
+Batch scaling (CPU, macOS dev machine, float64; best of 3 steady-state, compile
+excluded; fixed-seed mu draw in [30, 70], tol 1e-9, max_iterations 100; "conv" =
+converged lanes traced/host):
+
+| B | host seq (s) | traced vmap (s) | host s/solve | traced s/solve | speedup | conv | compile+1st (s) |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.030 | 0.001 | 0.0296 | 0.0014 | **21.7x** | 1/1 | 3.5 |
+| 4 | 0.062 | 0.155 | 0.0154 | 0.0387 | 0.40x | 3/4 | 3.8 |
+| 16 | 0.586 | 0.621 | 0.0367 | 0.0388 | 0.94x | 12/14 | 5.0 |
+| 64 | 1.919 | 2.416 | 0.0300 | 0.0378 | 0.79x | 55/58 | 8.7 |
+| **15, stall-free pinned batch** | 0.266 | 0.042 | 0.0177 | 0.0028 | **6.4x** | 15/15 | — |
+
+Read the two halves together: with a *stall-free* batch (the gate tests' 15 verified
+pairs, 10–14 iterations per lane) batching pays **6.4x** on CPU; with a random
+parameter draw it pays **0.4–0.94x**, because ~5% of lanes land in zigzag stall pockets
+and run to max_iterations=100, and a batched while_loop pays max-over-lanes — one
+stalled lane drags 63 healthy ones through ~90 masked passes each. The B=1 row (7–22x
+across repeated runs; absolute times are milliseconds and noisy) measures pure
+host-loop overhead: at 54 free DOF the Python driver's ~40 syncs/solve dominate the
+compiled loop. The practical guidance for the Fisher caller is in the numbers: batch
+under vmap, keep max_iterations tight relative to the healthy iteration count (or
+accept the drag), and read `converged` rather than assuming the budget sufficed. GPU
+scaling is untested: linbox01's RTX 4090 was fully occupied (100% util, 23/24 GB) on
+benchmark day; the CPU numbers already establish the mechanism (masking works, the
+drag is max-over-lanes, homogeneous batches win) and the GPU would change constants,
+not structure.
+
+What a reviewer would attack first: the pinned gate fixtures. Every comparison fixture
+is pinned to parameters verified to converge on *both* drivers *under the exact
+compiled program the test runs* — because pocket membership moves between compilations
+(FINDINGS.md), including between an 8-lane and a 15-lane vmap of the same code. That is
+determinism engineering, not cherry-picking: an equivalence gate is only defined where
+both drivers converge, the stall behaviour is itself reported (the host driver stalls
+at mu=45 on the same scene, so the pockets predate this branch), and the unconverged
+case has its own gate (the NaN poison, tested asymmetrically). Second target: the
+random-draw benchmark rows are stall-dominated — that is the point of publishing both
+halves of the table, and the stall-free row is the mechanism's honest ceiling on this
+CPU. Third: gradient reproducibility across compilations is bounded at ~1e-5 by the
+host-path `_adjoint_cg` CG tolerance; tightening it would sharpen both adjoints but
+touches the host path, so it was left alone on this branch.
