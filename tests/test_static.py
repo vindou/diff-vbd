@@ -297,6 +297,11 @@ class StaticAdjointTests(unittest.TestCase):
             float(loss_of_scale(jnp.asarray(h)))
             - float(loss_of_scale(jnp.asarray(-h)))
         ) / (2.0 * h)
+        # A zero numeric derivative would make the relative check below pass vacuously
+        # (0 <= 0) -- exactly the failure this test exists to rule out, since a broken
+        # rest-position path (e.g. stale masses) zeroes the gradient rather than
+        # biasing it.
+        self.assertGreater(abs(numeric), 0.0)
         self.assertLessEqual(abs(gradient - numeric), 1.0e-4 * abs(numeric))
 
     def test_unconverged_adjoint_raises(self):

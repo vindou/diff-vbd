@@ -82,18 +82,20 @@ resolve against the config file's directory).
 
 ### Contact
 
-Intersection-free contact via the IPC log barrier: continuous collision detection, lagged
-Coulomb friction, analytic colliders (plane / sphere), and mesh self-collision. Colliders and
-mesh-mesh pairs go through the same barrier, the same friction model and the same
-time-of-impact filter — they are one code path, not two.
+Intersection-free contact: IPC-style activation energies (log barrier, quadratic penalty,
+or OGC's two-stage function), lagged Coulomb friction, analytic colliders (plane / sphere),
+and mesh self-collision guaranteed intersection-free by per-vertex conservative bounds
+[Wu et al. 2020]. Colliders and mesh-mesh pairs go through the same activation energy, the
+same friction model and the same per-vertex motion clipping — one code path, not two.
 
 ```yaml
 contact:
   enabled: true
-  d_hat: 1.0e-3          # activation distance: the barrier turns on inside this gap
+  d_hat: 1.0e-3          # activation distance: contact forces turn on inside this gap
   # kappa: 1.0e3         # omit to derive a stiffness matched to the inertia term
   friction_mu: 0.3       # Coulomb coefficient; 0 for frictionless
   eps_v: 1.0e-4          # sliding speed below which a contact is treated as stuck
+  activation: barrier    # barrier (IPC log) | penalty (quadratic) | two_stage (OGC)
   self_collision: false  # also detect the mesh against itself
   colliders:
     - kind: plane
@@ -109,6 +111,21 @@ See [`examples/block_on_plane.yaml`](examples/block_on_plane.yaml). A body suppo
 collider needs **no Dirichlet constraint** — resting on the ground is well-posed on its own,
 so that example has no `dirichlet` block at all.
 
+#### Contact activation energies
+
+Three activation energies are selectable (all published; none of this is novel to this
+repo): the **IPC log barrier** [Li et al. 2020] — C2 at `d_hat`, infinite force at zero
+gap, curvature growing like `1/gap^2`; the **quadratic penalty** (the VBD paper's) —
+cheap, bounded, and *not* intersection-free; and OGC's **two-stage activation**
+[Chen et al. 2025, Eq. 18] — a quadratic near `d_hat` stitched C2-continuously at
+`tau = d_hat/2` onto a pure log, keeping the barrier's infinite force while the quadratic
+stage's curvature stays exactly `kappa`. Two honest notes: the two-stage energy is only C1
+*at* `d_hat` (its curvature steps from `kappa` to zero there, as any quadratic
+activation's must — the log barrier is C2 there), and the stitch coefficient printed in
+the OGC paper (its Eq. 19) is dimensionally inconsistent; the implementation derives the
+correct one and the tests would catch the printed form. The legacy `use_barrier` boolean
+still works and maps onto the enum; specifying both is an error.
+
 **Contact needs float64.** Pass `--precision float64`. The barrier resolves a gap orders of
 magnitude smaller than the mesh coordinates, and it obtains that gap by *subtracting* them:
 in float32, at a coordinate of 100, the absolute resolution is `1.2e-5`, so a small positive
@@ -118,37 +135,52 @@ intersection-freedom to rounding before any solver logic runs. `assemble_problem
 
 #### What "intersection-free" actually guarantees
 
-The guarantee is enforced by a **time-of-impact filter on the whole sweep**, not per vertex.
-A per-vertex bound certifies one vertex moving against frozen geometry, but VBD solves a
-whole colour in parallel from one snapshot — if a contact pair's endpoints share a colour,
-both move and neither certificate covers their combined motion. Worse, Chebyshev acceleration
-extrapolates *after* every local solve has finished, where no per-vertex check can see it.
-Scaling the entire update by a single conservative factor bounds where the mesh actually ended
-up, whatever the interior did.
+The guarantee is enforced by **per-vertex conservative bounds** (Wu et al. 2020, as used
+by Offset Geometric Contact [Chen et al., SIGGRAPH 2025]). At every contact detection,
+each vertex gets a budget
 
-For analytic colliders the bound is closed-form and holds unconditionally. For mesh-mesh it
-rests on the pair set being complete, and that needs two things that work only as a pair:
+```
+b_v = 0.45 * min(distance to everything v's primitives could first touch, detection band)
+```
 
-* the detection band is derived from how far the mesh is about to move, not from `d_hat`, so
-  every pair that could reach contact this step is in the set; and
-* the sweep clamps each vertex's **cumulative** displacement, so none can leave the band it
-  was detected under.
+and every displacement the solver produces — the initial guess, each iteration's output,
+Chebyshev extrapolation included — is truncated so no vertex strays further than `b_v`
+from where detection saw it. If the state at detection was intersection-free, it stays
+intersection-free: both sides of a pair at distance `d` have budgets below `d/2`, and a
+primitive distance is 1-Lipschitz in each side, so the pair cannot close. Both endpoints
+moving simultaneously is priced in — that factor of one half is what lets single-vertex
+certificates compose where they naively could not, and it needs **no CCD and no global
+reduction at all**. (An earlier revision of this solver scaled the whole sweep by a single
+time-of-impact scalar for exactly that composability worry; the bound above is the
+literature's answer to it, and the global filter — along with its documented failure mode,
+a time of impact collapsing to zero and silently freezing the entire mesh — is gone.)
 
-The cost is real and it is the honest limit: the band grows with speed, and past roughly one
-body-length of travel per step no once-per-step candidate set can be both bounded and
-complete. At that point the pair capacity overflows and says so. **That is by design** — the
-alternative is a band that quietly under-covers and lets a surface tunnel unseen. Reduce
-`solver.dt`, or set `self_collision_ccd: false` to trade the guarantee for speed (it warns).
+Bounds are refreshed by detection, and detection re-runs mid-step once ~1% of the
+vertices have consumed their budgets, re-anchoring everyone with fresh distances. The
+detection band is now a **performance knob, not a soundness parameter**: a pair beyond
+the band is further apart than any two budgets can close, so an undersized band costs
+re-detections, never an intersection. The band still grows with speed so that a fast
+free-flying body fits its step inside one detection interval.
 
-Two limits worth stating plainly:
+Three limits worth stating plainly:
 
-* *"No **non-adjacent** surface primitive pair intersects."* Primitives that share a vertex are
-  excluded from detection — a vertex always touches its own triangles — so a triangle inverting
-  through its own neighbour is a tet-inversion problem, not a contact one.
-* Grazing motion at speed is **over-throttled**, not unsafe. The conservative advance is
-  proportional to the gap, so two surfaces sliding past each other fast at a tiny separation
-  exhaust the iteration budget and the step gets shorter than it needed to be. The solver
-  reports this rather than silently freezing.
+* *"No **non-adjacent** surface primitive pair intersects."* Primitives that share a vertex
+  are excluded from detection — a vertex always touches its own triangles — so a triangle
+  inverting through its own neighbour is a tet-inversion problem, not a contact one.
+* **Near-contact stepping is still slow — but now only near the contact.** A vertex resting
+  at gap `~d_hat` has a budget of `~0.45 * d_hat` per detection interval; OGC states plainly
+  that these bounds only pay off fully with a *large* contact radius, which needs its offset
+  geometry (not implemented here) to be artifact-free. So this scheme converts **global**
+  throttling into **local** throttling: only vertices actually near contact are slowed,
+  instead of the whole mesh being scaled back by its worst offender. It does not make
+  near-contact stepping cheap.
+* Prescribed (Dirichlet) and rigid-region motion cannot be truncated — one is a boundary
+  condition, the other is rewritten by the rigid projection after every filter. Prescribed
+  targets are therefore applied in per-iteration increments (re-detecting on demand to
+  refresh budgets), which keeps scripted presses at ordinary speeds working; a single
+  increment that exceeds even a freshly detected budget, or a rigid row that outruns its
+  bound, is a hard error naming the vertex and the fix (smaller `dt`, more iterations, or
+  slow the motion).
 
 `self_collision` also requires a **conforming** tetrahedralisation, and checks it: a
 non-conforming split leaves interior faces unpaired, they get reported as *surface* faces, and
@@ -166,7 +198,7 @@ every vertex evaluates all of its slots on every local solve, of which there are
 (colours × sweeps) per step, and the whole thing sits inside a Hessian. Measured on
 [`examples/two_blocks.yaml`](examples/two_blocks.yaml): 128 → 9 s/step, 256 → 19 s/step. Size
 it tightly; the overflow error names the exact number you need. `capacity` is much cheaper (it
-only feeds the time-of-impact filter, a shallow kernel), so give that one room.
+only feeds the per-vertex bound computation, a shallow host-side pass), so give that one room.
 
 Flat-on-flat contact between two coincident faces is the case that stresses `max_per_vertex`:
 it generates a large edge-edge fan at a single vertex.
@@ -210,8 +242,50 @@ four times; the tests pin that factor exactly rather than assuming it.
 Two limits worth stating: gradients of these potentials do not differentiate through
 contact *detection* (the active set and classifications are frozen inputs, refreshed by
 `redetect_contacts`), and monotone descent of G is only guaranteed in the regime the VBD
-paper's argument covers — line search on, Chebyshev acceleration off, no contact filter
-rescaling the sweep.
+paper's argument covers — line search on, Chebyshev acceleration off, no per-vertex
+bound truncation rescaling an update.
+
+### Static equilibrium and the adjoint
+
+`potential_energy` used to describe itself as "the hook a future adjoint path attaches
+to"; the hook now has something attached:
+
+```python
+result = dv.solve_static_equilibrium(problem, tol=1e-9)   # residual tolerance, never a count
+adjoint = dv.StaticAdjoint(problem, tol=1e-9)
+gradients = jax.grad(lambda p: loss(adjoint(p)))(dv.StaticParams(mu=mu0))
+```
+
+`body_force_potential` completes the static energy (gravity was previously baked into the
+per-step inertial target, which only exists inside a timestep), and
+`solve_static_equilibrium` minimises it with matrix-free Newton-CG — Hessian-vector
+products via `jvp`-of-gradient, `H` never assembled. `StaticAdjoint` differentiates the
+equilibrium implicitly (`du*/dp = -H^{-1} dg/dp`) for material parameters, density, rest
+positions, body force and collider parameters, at the cost of one extra CG solve — never
+by unrolling the solver.
+
+The design constraint worth knowing: **implicit differentiation is only true at a
+stationary point.** A fixed-count VBD sweep's output is not one, so the solver terminates
+on a residual tolerance, VBD sweeps are allowed only as a (never-differentiated) warm
+start, and asking `StaticAdjoint` for a gradient at a state whose residual exceeds its
+tolerance raises rather than returning the plausible-looking gradient of nothing. Static
+solves refuse friction (not the gradient of any potential), rigid regions (a constraint
+outside the energy) and self-collision (the pair set is only complete within a band sized
+for one dynamic step); each refusal names its reason and remedy. Like every interior-point
+method, the solve needs a feasible (non-penetrating) initial state. Dynamic per-step and
+trajectory adjoints are out of scope on this branch; they inherit the same precondition
+in a harsher form — every step of the trajectory would have to be solved to stationarity
+of its own objective before the implicit-function argument applies.
+
+### Validation
+
+The forward contact model is checked against the canonical closed-form benchmark: a rigid
+sphere indenting an elastic slab (Hertz). `tests/test_hertz.py` fits `log P` vs
+`log delta` over a factor-4 range of indentations and pins **both** the exponent (3/2 —
+the contact model) and the coefficient (`(4/3) E* sqrt(R)` — that stable Neo-Hookean
+really reduces to linear elasticity at small strain, which nothing else in the suite
+verifies). Measured numbers, mesh-resolution caveats and the barrier-standoff sensitivity
+are in `RESULTS.md`.
 
 ## Testing
 

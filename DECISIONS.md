@@ -52,3 +52,32 @@ Format: date · decision · rationale. Append-only.
   against *static* colliders (no other party moves), and with it plus adaptive Levenberg
   damping (the log barrier's quadratic model overshoots wildly near contact) the gate
   scene converges in 9 Newton iterations to a 4e-12 residual.
+- **2026-07-16 · M6 (OGC offset geometry) not attempted.** The brief marks it stretch,
+  all-or-nothing, and conditional on M1–M4 being green with budget to spare. The
+  remaining budget went to making M1's protocol honest (the first two attempts produced
+  frozen-mesh garbage worth understanding rather than papering over) and to verifying
+  M3 end to end. A half-implemented contact model is worse than none — Polyhedral Gauss
+  Maps, the constructive block definitions, feasible-region checks and the edge-only
+  manifold are a large, coupled lift — so per the brief's own rule it was not started.
+  What is lost without it is quantified rather than hand-waved: the M2 measurement in
+  RESULTS.md shows the two-stage activation only pays off at a large standoff, and the
+  M3 caveat (bounds ~ gamma_p * d_hat for resting vertices) is stated in the README.
+- **2026-07-16 · M1's load gate is per-indentation, not the fitted intercept.** The
+  log-log intercept extrapolates to delta = 1, five decades from the data, so the
+  +-0.03 exponent noise of a coarse contact patch swings it ~15% run to run — it failed
+  once on pure fit noise while every per-delta load was inside the calibrated band. The
+  gate now takes the loads at the measured indentations (geometric-mean ratio within
+  25%, each within 35%); the intercept is printed for information.
+
+- **2026-07-16 · M1's load band (25%) is calibrated by a refinement study, not
+  tuned to a failing number.** At the committed CPU-budget resolution (fine cell 0.05,
+  a_min/h = 1) the measured load sits 12–20% above Hertz; refining to h = 0.035 and
+  0.025 moves the band to 11–17% and 10–15% — monotone convergence toward theory, with
+  the residual consistent with the bonded base at depth exactly 10·a_max (a known ~5–8%
+  stiffening Hertz's half-space does not have). The full three-resolution table is in
+  RESULTS.md. The gate is the measured discretization band plus margin; the failure the
+  test exists to catch (a wrong contact model) presents as a ~1.3x+ coefficient or a
+  wrong exponent, both far outside it. Two earlier driving mechanisms (collider ramp,
+  velocity-zeroed relaxation) produced frozen-mesh garbage and non-converging far
+  fields respectively; both are documented in the test docstring, and the final
+  protocol is static-settle plus dynamic certification.
