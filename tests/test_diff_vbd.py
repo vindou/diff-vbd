@@ -1,7 +1,8 @@
+import json
+import os
 import struct
 import tempfile
 import unittest
-import json
 from pathlib import Path
 
 import jax
@@ -1265,6 +1266,36 @@ class DiffVbdTests(unittest.TestCase):
         )
 
     def test_apply_runtime_config_disables_gpu_preallocation_by_default(self):
+        """Runtime config mutates *process-global* JAX state; put it all back.
+
+        ``apply_runtime_config`` defaults to ``precision="float32"`` and therefore flips
+        ``jax_enable_x64`` off for the whole process. Without the restore below, every
+        float64 test that happens to run after this one silently executes in float32 —
+        which broke the elastic-potential gradient checks in a way that depended on
+        pytest's file ordering and passed in isolation. The cleanup restores both the
+        live JAX flag and the environment variables the call rewrites.
+        """
+        saved_x64 = bool(jax.config.jax_enable_x64)
+        saved_env = {
+            name: os.environ.get(name)
+            for name in (
+                "JAX_ENABLE_X64",
+                "JAX_PLATFORMS",
+                "XLA_PYTHON_CLIENT_PREALLOCATE",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION",
+            )
+        }
+
+        def restore():
+            jax.config.update("jax_enable_x64", saved_x64)
+            for name, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.addCleanup(restore)
+
         runtime_config = apply_runtime_config(platform="gpu")
         self.assertEqual(runtime_config["platform"], "gpu")
         self.assertFalse(runtime_config["gpu_preallocate"])
