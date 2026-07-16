@@ -109,7 +109,19 @@ def _collider_toi(
 
     def sphere():
         start_gap = sphere_signed_distance(start, center, radius, outside)
-        return _lipschitz_toi(start_gap, end - start, slack)
+        end_gap = sphere_signed_distance(end, center, radius, outside)
+        toi = _lipschitz_toi(start_gap, end - start, slack)
+        # Already through: only motion that increases the gap is allowed -- the same
+        # escape clause `_plane_toi` documents. Without it a vertex that starts inside
+        # the sphere freezes at toi = 0 *even for a step that climbs back out*, and
+        # since the sweep filter takes a global minimum, one such vertex deadlocks the
+        # entire mesh permanently. (The static solver hit exactly this: an indenting
+        # sphere overlapping the initial state could never be escaped.)
+        return jnp.where(
+            start_gap <= 0.0,
+            jnp.where(end_gap > start_gap, jnp.ones_like(toi), jnp.zeros_like(toi)),
+            toi,
+        )
 
     toi = jax.lax.switch(kind, (plane, sphere))
     return jnp.where(enabled, toi, jnp.ones_like(toi))
