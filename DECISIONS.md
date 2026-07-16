@@ -81,3 +81,62 @@ Format: date · decision · rationale. Append-only.
   velocity-zeroed relaxation) produced frozen-mesh garbage and non-converging far
   fields respectively; both are documented in the test docstring, and the final
   protocol is static-settle plus dynamic certification.
+
+## feature/traced-static
+
+- **2026-07-16 · The traced driver is a sibling, not a flag; the host path is untouched
+  byte-for-byte.** `solve_static_equilibrium_traced` and `StaticAdjointTraced` sit next
+  to their host twins rather than behind a `traced=True` switch, because the two differ
+  in failure contract, not just execution: the host adjoint raises on an unconverged
+  state, the traced one poisons the sample's gradient with NaN. A flag that silently
+  swaps "raises on bad input" for "returns NaN on bad input" is a behaviour change that
+  should be visible at the call site. The backward-pass math is transcribed rather than
+  refactored into a shared helper so the host path's bytes (and tests) cannot move.
+
+- **2026-07-16 · The traced line search is a nested `lax.while_loop`, not vbd's alpha
+  ladder.** `vbd._apply_line_search` evaluates every rung and takes `argmin`; the static
+  solver takes the *first Armijo-acceptable* step of a halving ladder. Those are
+  different acceptance rules — argmin can pick a smaller step than first-acceptable, or
+  a rung first-acceptable never visits — and swapping one for the other is a solver
+  behaviour change, not a refactor. The nested while_loop preserves the host rule
+  exactly (1–5 objective evaluations typical) at the cost of batched rungs running to
+  the slowest element; the agreement gate (traced == host to 1e-10) is what enforces
+  this choice stays honest.
+
+- **2026-07-16 · The traced carry gains a `stagnated` flag beyond the brief's six
+  fields, and the pass cap is `13 * max_iterations + 13`.** The host loop's two `break`s
+  (no descent direction after both clip fallbacks; a rejection with the Levenberg shift
+  already at its 1e6 ceiling) cannot stop a `lax.while_loop` from inside the body — the
+  predicate sees only carried state, so "stop this element" must be data. The pass cap
+  bounds the retry ladder: a rejection raises the shift 0 → 1e-4 → … → 1e6 in at most
+  11 steps and the next rejection sets `stagnated`, so 13 passes per accepted Newton
+  step plus one final ladder bounds every trajectory the host loop could take; the cap
+  exists so a pathological element cannot spin a batch forever, and it can never bind
+  first on a healthy solve.
+
+- **2026-07-16 · Unconverged traced gradients are NaN-poisoned, not checkify'd.** The
+  backward pass multiplies the sample's cotangent by `where(converged, 1, NaN)`. NaN
+  propagates through every downstream reduction, cannot be silently consumed, stays
+  confined to its own batch element, and needs no cooperation from the caller's jit
+  boundary; `checkify` would give a real exception but demands the caller thread and
+  check an error value, and a forgotten check is exactly the silent-wrong-gradient
+  failure this refusal exists to prevent. `assert_converged` restores the host
+  adjoint's loud error at any batch boundary for callers who want it.
+
+- **2026-07-16 · Agreement/batching fixtures solve to 1e-11 so the 1e-10 gate is
+  honest; fixture parameters are pinned to verified-convergent values.** Both drivers
+  stop at the first iterate below `tol`, so two correct solves can disagree by
+  ~`tol/lambda_min` — measured 1.5e-10 at tol=1e-9 on the gate scene, *outside* the
+  1e-10 gate with both answers right. Solving the comparison fixtures to 1e-11 keeps
+  the gate at 1e-10 (tightened solve, untouched gate — the opposite of loosening).
+  Pinning matters because the near-contact Newton iteration has zigzag stall pockets
+  (FINDINGS.md) and *which* parameters stall differs between compilations of the same
+  math; every comparison fixture asserts convergence first, so rot fails loudly as a
+  fixture problem rather than silently as a gradient error.
+
+- **2026-07-16 · `warm_start_steps` is absent from the traced path.** It runs
+  `vbd.step`, which is host-side (concrete `float(state.time)` reads, host audits) and
+  is documented as forward-only relaxation. Tracing it would mean tracing the dynamic
+  stepper — out of scope and of dubious value, since the traced path's caller supplies
+  per-batch `initial_position` anyway. The traced docstring says so and points the
+  caller at `initial_position`.
